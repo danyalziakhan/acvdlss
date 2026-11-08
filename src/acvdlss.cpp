@@ -63,7 +63,8 @@ static int g_listen_frame = 0; // ImGui frame the key button was last drawn on
 static void load_settings()
 {
     bool enabled = true, debug = false;
-    uint32_t preset = 0, sharpness = 0;
+    uint32_t preset = 0;
+    int sharpness = 0;
     reshade::get_config_value(nullptr, SECTION, "Enabled", enabled);
     reshade::get_config_value(nullptr, SECTION, "Preset", preset);
     reshade::get_config_value(nullptr, SECTION, "Sharpness", sharpness);
@@ -71,7 +72,7 @@ static void load_settings()
     g_settings.enabled = enabled;
     g_settings.debug = debug;
     g_settings.preset = preset < std::size(PRESETS) ? preset : 0;
-    g_settings.sharpness = float(std::min(sharpness, 100u)) / 100.0f;
+    g_settings.sharpness = float(std::clamp(sharpness, 0, 100)) / 100.0f;
 
     int key = g_toggle_key;
     reshade::get_config_value(nullptr, SECTION, "ToggleKey", key);
@@ -212,7 +213,8 @@ static void draw_toggle_key(effect_runtime *runtime)
     // the Space or Enter that pressed the button is not taken as the answer.
     if (!g_listening || started || runtime == nullptr)
         return;
-    for (int vk = 0x08; vk < 256; ++vk)
+    // From the middle mouse button up: the left one pressed the button.
+    for (int vk = VK_MBUTTON; vk < 256; ++vk)
     {
         // The generic modifier codes repeat their left and right forms.
         if (!runtime->is_key_pressed(vk) || vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU)
@@ -344,9 +346,11 @@ static void on_overlay(effect_runtime *)
     if (std::chrono::steady_clock::now() >= g_indicator_until)
         return;
 
+    // Green only while DLSS is running. Otherwise amber, with the reason, and
+    // the window has the details.
     const taa_status s = taa_get_status();
-    std::string text = "DLSS: On";
-    ImVec4 color(0.45f, 0.9f, 0.45f, 1.0f);
+    std::string text;
+    ImVec4 color = WARNING_COLOR;
     if (!g_settings.enabled)
     {
         text = "DLSS: Off";
@@ -354,7 +358,16 @@ static void on_overlay(effect_runtime *)
     }
     else if (s.state == taa_state::running)
     {
-        text += " (" + describe_mode(s) + ")";
+        text = "DLSS: On (" + describe_mode(s) + ")";
+        color = ImVec4(0.45f, 0.9f, 0.45f, 1.0f);
+    }
+    else if (s.state == taa_state::unavailable || s.state == taa_state::failed)
+    {
+        text = "DLSS: Unavailable, see the ACV DLSS window";
+    }
+    else
+    {
+        text = "DLSS: On, waiting for the game's anti-aliasing";
     }
 
     ImGui::SetNextWindowPos(ImVec2(16.0f, 16.0f));
@@ -432,6 +445,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_overlay("ACV DLSS", draw_window);
         break;
     case DLL_PROCESS_DETACH:
+        lod_session_end();
         taa_unregister();
         reshade::unregister_addon(module);
         break;

@@ -13,6 +13,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <d3d12.h>
+#include <dxgi1_4.h>
 
 #include "acvdlss.h"
 #include "dlss.h"
@@ -203,6 +204,7 @@ struct pending_delivery
     resource target = {0};
     format fmt = format::unknown;
     uint32_t width = 0, height = 0;
+    bool new_site = false; // the first delivery at this pass's root signature
 };
 
 struct __declspec(uuid("3c8e1f52-6a4d-4b9e-8d27-91f0a6c4e7b3")) list_state
@@ -296,6 +298,202 @@ void debug_event(const char *format, ...)
     reshade::log::message(reshade::log::level::info, text);
 }
 
+//----------------------------------------------------------------------------
+// With Debug on: where the add-on's own CPU time goes. Moving the camera makes
+// the game bind more tables and stream more textures, and every one of those
+// passes through the handlers below, so this is what separates the add-on's
+// cost from the game's.
+
+enum probe : size_t
+{
+    P_BIND,
+    P_MATCH,
+    P_REDIRECT,
+    P_DELIVERY,
+    P_DRAW,
+    P_REPLACE,
+    P_CONTEXT_LOCK,
+    P_EVALUATE,
+    P_INIT_RESOURCE,
+    P_DESTROY_RESOURCE,
+    P_TRACKING,
+    P_TEXTURE_LOCK,
+    P_COUNT
+};
+const char *const PROBE_NAMES[P_COUNT] = {
+    "table binds",
+    "TAA matching",
+    "redirect checks",
+    "FSR checks",
+    "draws",
+    "DLSS recording",
+    "waiting for the frame lock",
+    "DLSS evaluate",
+    "texture creation",
+    "texture release",
+    "descriptor tracking",
+    "texture lock waits",
+};
+
+struct probe_total
+{
+    std::atomic<uint64_t> ns{0}, calls{0}, worst_ns{0};
+};
+probe_total g_probes[P_COUNT];
+
+// Frames presented so far.
+std::atomic<uint64_t> g_frames{0};
+
+uint64_t now_ns()
+{
+    return uint64_t(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
+void probe_add(size_t p, uint64_t ns)
+{
+    probe_total &t = g_probes[p];
+    t.ns += ns;
+    ++t.calls;
+    uint64_t worst = t.worst_ns;
+    while (ns > worst && !t.worst_ns.compare_exchange_weak(worst, ns))
+    {
+    }
+}
+
+class probe_scope
+{
+public:
+    explicit probe_scope(size_t p) : _p(p), _start(g_settings.debug ? now_ns() : 0) {}
+    ~probe_scope()
+    {
+        if (_start != 0)
+            probe_add(_p, now_ns() - _start);
+    }
+    probe_scope(const probe_scope &) = delete;
+    probe_scope &operator=(const probe_scope &) = delete;
+
+private:
+    size_t _p;
+    uint64_t _start;
+};
+
+// descriptor_tracking's own handlers run between these two, which ReShade
+// calls in the order they were registered.
+thread_local uint64_t t_tracking_start = 0;
+
+bool on_tracking_begin(device *, uint32_t, const void *)
+{
+    t_tracking_start = g_settings.debug ? now_ns() : 0;
+    return false;
+}
+
+bool on_tracking_end(device *, uint32_t, const void *)
+{
+    if (t_tracking_start != 0)
+        probe_add(P_TRACKING, now_ns() - t_tracking_start);
+    t_tracking_start = 0;
+    return false;
+}
+
+bool on_copy_tables_begin(device *dev, uint32_t count, const descriptor_table_copy *copies)
+{
+    return on_tracking_begin(dev, count, copies);
+}
+bool on_copy_tables_end(device *dev, uint32_t count, const descriptor_table_copy *copies)
+{
+    return on_tracking_end(dev, count, copies);
+}
+bool on_update_tables_begin(device *dev, uint32_t count, const descriptor_table_update *updates)
+{
+    return on_tracking_begin(dev, count, updates);
+}
+bool on_update_tables_end(device *dev, uint32_t count, const descriptor_table_update *updates)
+{
+    return on_tracking_end(dev, count, updates);
+}
+
+// With Debug on: GPU timestamps around the add-on's work in the game's command
+// list, read back a few frames later.
+class gpu_timer
+{
+public:
+    static const uint32_t RING = 8;
+    static const uint32_t MARKS = 4; // before prepare, after prepare, after DLSS, after finish
+
+    bool ready() const { return _heap != nullptr; }
+
+    void init(ID3D12Device *device)
+    {
+        D3D12_QUERY_HEAP_DESC desc = {D3D12_QUERY_HEAP_TYPE_TIMESTAMP, RING * MARKS, 0};
+        if (FAILED(device->CreateQueryHeap(&desc, IID_PPV_ARGS(&_heap))))
+            return;
+        D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_READBACK};
+        D3D12_RESOURCE_DESC buffer = {};
+        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width = RING * MARKS * sizeof(uint64_t);
+        buffer.Height = 1;
+        buffer.DepthOrArraySize = 1;
+        buffer.MipLevels = 1;
+        buffer.SampleDesc.Count = 1;
+        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                   nullptr, IID_PPV_ARGS(&_readback))))
+        {
+            _heap->Release();
+            _heap = nullptr;
+        }
+    }
+
+    void shutdown()
+    {
+        if (_readback != nullptr)
+            _readback->Release();
+        if (_heap != nullptr)
+            _heap->Release();
+        _readback = nullptr;
+        _heap = nullptr;
+    }
+
+    void mark(ID3D12GraphicsCommandList *list, uint64_t frame, uint32_t index)
+    {
+        list->EndQuery(_heap, D3D12_QUERY_TYPE_TIMESTAMP, uint32_t(frame % RING) * MARKS + index);
+    }
+
+    void resolve(ID3D12GraphicsCommandList *list, uint64_t frame)
+    {
+        const uint32_t first = uint32_t(frame % RING) * MARKS;
+        list->ResolveQueryData(_heap, D3D12_QUERY_TYPE_TIMESTAMP, first, MARKS, _readback, first * sizeof(uint64_t));
+        _written[frame % RING] = frame + 1;
+    }
+
+    // The three spans of a frame recorded at least RING - 2 frames ago, in
+    // ticks, or false if that frame did not run DLSS.
+    bool read(uint64_t frame, uint64_t spans[MARKS - 1])
+    {
+        if (_heap == nullptr || _written[frame % RING] != frame + 1)
+            return false;
+        const uint32_t first = uint32_t(frame % RING) * MARKS;
+        D3D12_RANGE range = {first * sizeof(uint64_t), (first + MARKS) * sizeof(uint64_t)};
+        void *data = nullptr;
+        if (FAILED(_readback->Map(0, &range, &data)))
+            return false;
+        uint64_t t[MARKS];
+        memcpy(t, static_cast<const uint8_t *>(data) + range.Begin, sizeof(t));
+        const D3D12_RANGE nothing = {0, 0};
+        _readback->Unmap(0, &nothing);
+        for (uint32_t i = 0; i + 1 < MARKS; ++i)
+            spans[i] = t[i + 1] >= t[i] ? t[i + 1] - t[i] : 0;
+        return true;
+    }
+
+private:
+    ID3D12QueryHeap *_heap = nullptr;
+    ID3D12Resource *_readback = nullptr;
+    uint64_t _written[RING] = {};
+};
+gpu_timer g_timer;
 
 float read_float(const uint8_t *cb, size_t offset)
 {
@@ -416,6 +614,17 @@ struct texture_info
 std::shared_mutex g_textures_lock;
 std::unordered_map<uint64_t, texture_info> g_textures;
 
+// Only the resource a table slot points at, or 0. The handle may belong to a
+// resource that is gone, so it is only ever compared, never used.
+uint64_t resource_at(device *dev, const descriptor_tracking &tracking, descriptor_table table, uint32_t binding)
+{
+    descriptor_heap heap = {0};
+    uint32_t offset = 0;
+    dev->get_descriptor_heap_offset(table, binding, 0, &heap, &offset);
+    const resource_view view = view_at(tracking, heap, offset);
+    return view.handle != 0 ? dev->get_resource_from_view(view).handle : 0;
+}
+
 // The texture a table slot points at, or false for an empty or stale slot.
 bool read_texture(device *dev, const descriptor_tracking &tracking, descriptor_table table, uint32_t binding,
                   texture_entry &e)
@@ -432,7 +641,10 @@ bool read_texture(device *dev, const descriptor_tracking &tracking, descriptor_t
 
     texture_info info;
     {
+        const uint64_t asked = g_settings.debug ? now_ns() : 0;
         std::shared_lock lock(g_textures_lock);
+        if (asked != 0)
+            probe_add(P_TEXTURE_LOCK, now_ns() - asked);
         const auto it = g_textures.find(res.handle);
         if (it == g_textures.end())
             return false;
@@ -482,10 +694,64 @@ void log_near_miss(const list_state &st, uint32_t param, const texture_entry *en
     reshade::log::message(reshade::log::level::info, line.c_str());
 }
 
+uint64_t site_key(pipeline_layout layout, uint32_t param)
+{
+    return layout.handle ^ (uint64_t(param) << 56);
+}
+
+// A few root signature and parameter pairs a pass was found at. Asked on every
+// table bind, so reading takes no lock; adding is rare and takes one.
+class site_set
+{
+public:
+    bool empty() const { return _count == 0; }
+
+    bool contains(uint64_t key) const
+    {
+        const uint32_t count = _count;
+        for (uint32_t i = 0; i < count; ++i)
+            if (_keys[i] == key)
+                return true;
+        return false;
+    }
+
+    // True if the key was not there before.
+    bool add(uint64_t key)
+    {
+        std::lock_guard lock(_lock);
+        const uint32_t count = _count;
+        if (contains(key) || count == CAPACITY)
+            return false;
+        _keys[count] = key;
+        _count = count + 1;
+        return true;
+    }
+
+private:
+    static const uint32_t CAPACITY = 8;
+    std::atomic<uint64_t> _keys[CAPACITY] = {};
+    std::atomic<uint32_t> _count{0};
+    std::mutex _lock;
+};
+
+// The root signature and parameter the TAA table was found at. Reading every
+// table the game binds costs its render threads real CPU time, so once a site
+// is known, only tables there are read. Everything is read again on the first
+// frame the TAA goes missing, which also picks up a root signature the game
+// makes for it later. A periodic full scan was tried and dropped: in a busy
+// scene it cost 30 ms of CPU on that frame, a visible hitch every 2 seconds.
+site_set g_taa_sites;
+std::atomic<uint64_t> g_taa_frame{0}; // the last frame DLSS replaced the TAA in
+
 void try_match(command_list *cmd, list_state &st, uint32_t param, descriptor_table table)
 {
     const table_layout *layout = st.graphics.table(param);
     if (layout == nullptr || layout->textures.size() < 6)
+        return;
+    const uint64_t key = site_key(st.graphics.layout, param);
+    const uint64_t frame = g_frames;
+    const bool scan = g_taa_sites.empty() || frame > g_taa_frame + 1;
+    if (!scan && !g_taa_sites.contains(key))
         return;
 
     device *dev = cmd->get_device();
@@ -512,6 +778,7 @@ void try_match(command_list *cmd, list_state &st, uint32_t param, descriptor_tab
         return;
     }
     ++g_tables_matched;
+    g_taa_sites.add(key);
     st.armed = true;
     st.replaced = false;
     st.skipped = 0;
@@ -525,6 +792,9 @@ void try_match(command_list *cmd, list_state &st, uint32_t param, descriptor_tab
 // resolution scale one of them scales the frame up to the screen, and that is
 // the pass DLSS has to hand its full-size image to.
 
+// The trace reads every table, so it samples one frame in this many rather
+// than skew the timing logged beside it.
+const uint64_t TRACE_EVERY = 600;
 std::atomic<uint64_t> g_taa_output{0};
 std::mutex g_trace_lock;
 std::unordered_set<uint64_t> g_traced;
@@ -685,8 +955,6 @@ struct redirect_site
     uint32_t binding = 0;
 };
 
-// Frames presented so far, for the discovery window below.
-std::atomic<uint64_t> g_frames{0};
 // After the frame changes size or texture, tables are searched this long for
 // passes that read it. A pass found once stays known. More than one can turn
 // up: with FSR on, a pass that reads last frame's TAA output for something
@@ -715,9 +983,30 @@ struct upscale_state
 };
 upscale_state g_upscale;
 
+// Whether any of the above is in use, so the checks at every table bind can
+// return without the lock when nothing is upscaled. Written under the lock.
+std::atomic<bool> g_upscale_active{false};
+
+void refresh_active(const upscale_state &u)
+{
+    g_upscale_active = u.presented != nullptr || !u.redirected.empty();
+}
+
+// Mirrors of the above for the checks at every table bind, which only go on
+// to take the lock at a site where their pass was found, or while discovering.
+std::atomic<uint64_t> g_discover_until{0};
+site_set g_screen_sites; // the same pairs as g_upscale.sites
+site_set g_fsr_sites;    // where EASU and RCAS bind their tables
+
+bool discovering_now()
+{
+    return g_frames < g_discover_until;
+}
+
 void keep_discovering(upscale_state &u)
 {
     u.discover_until = g_frames + DISCOVERY_FRAMES;
+    g_discover_until = u.discover_until;
 }
 
 void publish_upscale(uint64_t taa_target, ID3D12Resource *presented, DXGI_FORMAT format, pipeline_layout taa_layout)
@@ -726,6 +1015,7 @@ void publish_upscale(uint64_t taa_target, ID3D12Resource *presented, DXGI_FORMAT
     if (presented != nullptr && g_upscale.presented != presented)
         keep_discovering(g_upscale);
     g_upscale.presented = presented;
+    refresh_active(g_upscale);
     g_upscale.format = format;
     g_upscale.taa_layout = taa_layout.handle;
     if (g_upscale.taa_targets[0] != taa_target && g_upscale.taa_targets[1] != taa_target)
@@ -745,6 +1035,7 @@ void stop_upscaling()
 {
     std::lock_guard lock(g_upscale.lock);
     g_upscale.presented = nullptr;
+    refresh_active(g_upscale);
 }
 
 // At a table bind: does this table read the frame where a known screen pass
@@ -752,6 +1043,10 @@ void stop_upscaling()
 // candidate, confirmed at the draw by its target size.
 void check_redirect(command_list *cmd, list_state &st, uint32_t param, descriptor_table table)
 {
+    if (!g_upscale_active)
+        return;
+    if (!discovering_now() && !g_screen_sites.contains(site_key(st.graphics.layout, param)))
+        return;
     std::vector<redirect_site> sites;
     uint64_t frames[6];
     bool upscaling, discovering;
@@ -817,6 +1112,7 @@ void apply_redirect(command_list *cmd, list_state &st)
         if (g_upscale.sites.size() >= MAX_SITES)
             return;
         g_upscale.sites.push_back({st.graphics.layout.handle, r.param, r.binding});
+        g_screen_sites.add(site_key(st.graphics.layout, r.param));
         if (g_settings.debug)
         {
             char text[128];
@@ -853,9 +1149,11 @@ void apply_redirect(command_list *cmd, list_state &st)
         if (g_upscale.redirected.size() >= 256)
             g_upscale.redirected.clear();
         g_upscale.redirected.insert(slot_key);
+        refresh_active(g_upscale);
     }
     else if (g_upscale.redirected.erase(slot_key) != 0)
     {
+        refresh_active(g_upscale);
         view.Format = DXGI_FORMAT(r.original.fmt);
         native->CreateShaderResourceView(reinterpret_cast<ID3D12Resource *>(r.original.res.handle), &view, slot);
     }
@@ -871,36 +1169,46 @@ void apply_redirect(command_list *cmd, list_state &st)
 // resampled into each skipped output, so nothing ever reads one unwritten.
 void check_delivery(command_list *cmd, list_state &st, uint32_t param, descriptor_table table)
 {
-    uint64_t targets[2];
-    {
-        std::lock_guard lock(g_upscale.lock);
-        if (g_upscale.presented == nullptr)
-            return;
-        std::copy(std::begin(g_upscale.taa_targets), std::end(g_upscale.taa_targets), targets);
-    }
+    if (!g_upscale_active)
+        return;
+    const uint64_t key = site_key(st.compute.layout, param);
+    if (!discovering_now() && !g_fsr_sites.contains(key))
+        return;
     const table_layout *layout = st.compute.table(param);
     device *dev = cmd->get_device();
     const auto *tracking = dev->get_private_data<descriptor_tracking>();
     if (layout == nullptr || layout->writes.empty() || tracking == nullptr)
         return;
 
+    uint64_t targets[2], chain[std::size(upscale_state().fsr_chain)];
+    {
+        std::lock_guard lock(g_upscale.lock);
+        if (g_upscale.presented == nullptr)
+            return;
+        std::copy(std::begin(g_upscale.taa_targets), std::end(g_upscale.taa_targets), targets);
+        std::copy(std::begin(g_upscale.fsr_chain), std::end(g_upscale.fsr_chain), chain);
+    }
+
     // EASU reads the TAA output and writes something bigger; RCAS reads what
-    // EASU wrote and writes something the same size.
-    texture_entry input;
+    // EASU wrote and writes something the same size. Only the resource is
+    // compared until one matches, which spares reading every slot in full.
     bool easu = false, rcas = false;
+    uint32_t input_binding = 0;
     for (uint32_t binding : layout->textures)
     {
-        if (!read_texture(dev, *tracking, table, binding, input))
+        const uint64_t handle = resource_at(dev, *tracking, table, binding);
+        if (handle == 0)
             continue;
-        easu = input.res.handle == targets[0] || input.res.handle == targets[1];
-        {
-            std::lock_guard lock(g_upscale.lock);
-            rcas = in_fsr_chain(g_upscale, input.res.handle);
-        }
+        easu = handle == targets[0] || handle == targets[1];
+        rcas = std::find(std::begin(chain), std::end(chain), handle) != std::end(chain);
         if (easu || rcas)
+        {
+            input_binding = binding;
             break;
+        }
     }
-    if (!easu && !rcas)
+    texture_entry input;
+    if ((!easu && !rcas) || !read_texture(dev, *tracking, table, input_binding, input))
         return;
 
     for (uint32_t binding : layout->writes)
@@ -912,7 +1220,7 @@ void check_delivery(command_list *cmd, list_state &st, uint32_t param, descripto
                                : output.width == input.width && output.height == input.height;
         if (fits)
         {
-            st.delivery = {true, output.res, output.fmt, output.width, output.height};
+            st.delivery = {true, output.res, output.fmt, output.width, output.height, g_fsr_sites.add(key)};
             return;
         }
     }
@@ -927,8 +1235,13 @@ bool deliver(command_list *cmd, list_state &st)
         if (g_upscale.presented == nullptr)
             return false;
         if (!in_fsr_chain(g_upscale, d.target.handle))
-        {
             g_upscale.fsr_chain[g_upscale.fsr_chain_next++ % std::size(g_upscale.fsr_chain)] = d.target.handle;
+        // The game cycles through more output textures than the chain holds,
+        // so a new texture is routine. Only a new site reopens discovery:
+        // past that, the checks at known sites already compare against the
+        // newest textures.
+        if (d.new_site)
+        {
             keep_discovering(g_upscale);
             debug_event("FSR 1 pass replaced, its output is %ux%u", d.width, d.height);
         }
@@ -971,6 +1284,54 @@ void disarm(list_state &st, const char *why)
     if (st.armed && !st.replaced)
         give_up(why);
     st.armed = false;
+}
+
+// With Debug on: the game's jitter beside the projection terms that carry it,
+// for the first frames at each size, and how many distinct positions it cycles
+// through. The game's offset is in render pixels and its projection carries
+// it as (-2x / width, +2y / height) at 0x1a8 and 0x1b8, which is what DLSS
+// expects as given. A sign or unit mistake here shows only when upscaling.
+void note_jitter(uint32_t width, uint32_t height, uint32_t output_width, float jx, float jy, const uint8_t *view_cb)
+{
+    static uint64_t size = 0;
+    static uint32_t frames = 0, distinct = 0;
+    static float seen[128][2];
+    static float low[2], high[2];
+    const uint64_t now = (uint64_t(width) << 32) | (uint64_t(height) << 16) | output_width;
+    if (now != size)
+    {
+        size = now;
+        frames = distinct = 0;
+        low[0] = low[1] = FLT_MAX;
+        high[0] = high[1] = -FLT_MAX;
+    }
+    if (frames < 8)
+        debug_event("jitter %.4f, %.4f px at %ux%u to %u wide; in NDC %.6f, %.6f by render size, %.6f by output "
+                    "size; view constants 0x1a8 %.6f, 0x1b8 %.6f, 0x1c0 %.6f, 0x1c4 %.6f",
+                    jx, jy, width, height, output_width, 2.0f * jx / float(width), -2.0f * jy / float(height),
+                    2.0f * jx / float(output_width), read_float(view_cb, 0x1a8), read_float(view_cb, 0x1b8),
+                    read_float(view_cb, 0x1c0), read_float(view_cb, 0x1c4));
+    if (frames < 128)
+    {
+        bool known = false;
+        for (uint32_t i = 0; i < distinct && !known; ++i)
+            known = std::abs(seen[i][0] - jx) < 1e-4f && std::abs(seen[i][1] - jy) < 1e-4f;
+        if (!known)
+        {
+            seen[distinct][0] = jx;
+            seen[distinct][1] = jy;
+            ++distinct;
+        }
+        low[0] = std::min(low[0], jx);
+        low[1] = std::min(low[1], jy);
+        high[0] = std::max(high[0], jx);
+        high[1] = std::max(high[1], jy);
+        if (++frames == 128)
+            debug_event("jitter at %ux%u: %u distinct positions in 128 frames, x %.3f to %.3f, y %.3f to %.3f; "
+                        "DLSS asks for at least %.0f when upscaling this far",
+                        width, height, distinct, low[0], high[0], low[1], high[1],
+                        8.0 * double(output_width) * double(output_width) / (double(width) * double(width)));
+    }
 }
 
 bool replace(command_list *cmd, list_state &st)
@@ -1016,7 +1377,11 @@ bool replace(command_list *cmd, list_state &st)
     if (const char *why = read_constants(dev, st.graphics, VIEW_PARAM, view_cb, cb::VIEW_SIZE))
         return give_up(std::string("view constant buffer: ") + why);
 
-    std::lock_guard lock(c.lock);
+    std::unique_lock<std::mutex> lock;
+    {
+        probe_scope waiting(P_CONTEXT_LOCK);
+        lock = std::unique_lock<std::mutex>(c.lock);
+    }
     c.last_seen = c.frame;
     const bool hdr = color.fmt == format::r16g16b16a16_float;
     const bool camera_only = motion.width != width || motion.height != height;
@@ -1074,6 +1439,8 @@ bool replace(command_list *cmd, list_state &st)
     frame.output_height = output_height;
     frame.jitter_x = jx;
     frame.jitter_y = jy;
+    if (g_settings.debug)
+        note_jitter(width, height, output_width, jx, jy, view_cb);
     frame.frame_ms = frame_time_ms(c);
     frame.hdr = hdr;
     frame.reset = history_valid == 0 || c.force_reset;
@@ -1090,10 +1457,23 @@ bool replace(command_list *cmd, list_state &st)
         c.queue->wait_idle();
 
     auto *list = reinterpret_cast<ID3D12GraphicsCommandList *>(cmd->get_native());
+    const bool timing = g_settings.debug;
+    if (timing && !g_timer.ready())
+        g_timer.init(reinterpret_cast<ID3D12Device *>(dev->get_native()));
+    const bool timed = timing && g_timer.ready();
+    if (timed)
+        g_timer.mark(list, c.frame, 0);
     c.work.prepare(list, {reinterpret_cast<ID3D12Resource *>(color.res.handle), DXGI_FORMAT(color.fmt)},
                    {reinterpret_cast<ID3D12Resource *>(motion.res.handle), DXGI_FORMAT(motion.fmt)},
                    {reinterpret_cast<ID3D12Resource *>(depth.res.handle), DXGI_FORMAT(depth.fmt)}, k);
-    if (!c.upscaler.evaluate(list, frame))
+    if (timed)
+        g_timer.mark(list, c.frame, 1);
+    bool evaluated;
+    {
+        probe_scope evaluating(P_EVALUATE);
+        evaluated = c.upscaler.evaluate(list, frame);
+    }
+    if (!evaluated)
     {
         // The game's TAA draws after all.
         c.work.abandon(list);
@@ -1104,9 +1484,16 @@ bool replace(command_list *cmd, list_state &st)
         return false;
     }
 
+    if (timed)
+        g_timer.mark(list, c.frame, 2);
     // The slider scales RCAS's lobe directly. AMD's stops would jump from
     // nothing to a quarter strength at the first step.
     c.work.finish(list, g_settings.sharpness, hdr, reinterpret_cast<ID3D12Resource *>(target.handle));
+    if (timed)
+    {
+        g_timer.mark(list, c.frame, 3);
+        g_timer.resolve(list, c.frame);
+    }
     restore(dev, list, st);
     publish_upscale(target.handle, upscale ? c.work.presented() : nullptr, c.work.color_format(), st.graphics.layout);
 
@@ -1115,6 +1502,7 @@ bool replace(command_list *cmd, list_state &st)
     c.have_jitter = true;
     c.force_reset = false;
     c.last_replaced = c.frame;
+    g_taa_frame = g_frames.load();
     ++g_counts.replaced;
     set_status(c, taa_state::running);
     return true;
@@ -1161,6 +1549,7 @@ void on_destroy_device(device *dev)
         g_ctx->queue->wait_idle();
     g_ctx->work.shutdown();
     g_ctx->upscaler.shutdown();
+    g_timer.shutdown();
     g_ctx.reset();
 }
 
@@ -1218,7 +1607,11 @@ void on_init_resource(device *dev, const resource_desc &desc, const subresource_
 {
     if (dev->get_api() != device_api::d3d12 || desc.type != resource_type::texture_2d)
         return;
+    probe_scope probe(P_INIT_RESOURCE);
+    const uint64_t asked = g_settings.debug ? now_ns() : 0;
     std::unique_lock lock(g_textures_lock);
+    if (asked != 0)
+        probe_add(P_TEXTURE_LOCK, now_ns() - asked);
     g_textures[res.handle] = {desc.texture.width, desc.texture.height, desc.texture.format};
 }
 
@@ -1240,8 +1633,12 @@ void forget_frame(uint64_t handle)
 
 void on_destroy_resource(device *, resource res)
 {
+    probe_scope probe(P_DESTROY_RESOURCE);
     {
+        const uint64_t asked = g_settings.debug ? now_ns() : 0;
         std::unique_lock lock(g_textures_lock);
+        if (asked != 0)
+            probe_add(P_TEXTURE_LOCK, now_ns() - asked);
         if (g_textures.erase(res.handle) == 0)
             return;
     }
@@ -1273,6 +1670,7 @@ void on_bind_descriptor_tables(command_list *cmd, shader_stage stages, pipeline_
 {
     if (g_ctx == nullptr)
         return;
+    probe_scope probe(P_BIND);
     list_state &st = state_of(cmd);
     const bool graphics = is_graphics(stages);
     root_state &root = graphics ? st.graphics : st.compute;
@@ -1291,14 +1689,18 @@ void on_bind_descriptor_tables(command_list *cmd, shader_stage stages, pipeline_
         root_value &v = root.at(first + i);
         v.kind = root_kind::table;
         v.value = tables[i].handle;
-        if (g_settings.debug)
+        if (g_settings.debug && g_frames % TRACE_EVERY == 0)
             trace_reads(cmd, st, graphics, first + i, tables[i]);
         if (!graphics)
         {
+            probe_scope delivery(P_DELIVERY);
             check_delivery(cmd, st, first + i, tables[i]);
             continue;
         }
-        check_redirect(cmd, st, first + i, tables[i]);
+        {
+            probe_scope redirect(P_REDIRECT);
+            check_redirect(cmd, st, first + i, tables[i]);
+        }
         if (st.armed && first + i == st.taa_param)
         {
             if (tables[i].handle == st.taa_table)
@@ -1306,7 +1708,10 @@ void on_bind_descriptor_tables(command_list *cmd, shader_stage stages, pipeline_
             disarm(st, "TAA table replaced before a draw");
         }
         if (g_settings.enabled && g_ctx->ready)
+        {
+            probe_scope match(P_MATCH);
             try_match(cmd, st, first + i, tables[i]);
+        }
     }
 }
 
@@ -1372,6 +1777,7 @@ bool on_any_draw(command_list *cmd)
 {
     if (g_ctx == nullptr)
         return false;
+    probe_scope probe(P_DRAW);
     list_state *st = cmd->get_private_data<list_state>();
     if (st == nullptr)
         return false;
@@ -1388,6 +1794,7 @@ bool on_any_draw(command_list *cmd)
     }
     if (!st->replaced)
     {
+        probe_scope recording(P_REPLACE);
         if (!replace(cmd, *st))
         {
             st->armed = false;
@@ -1423,15 +1830,188 @@ bool on_dispatch(command_list *cmd, uint32_t x, uint32_t y, uint32_t z)
     list_state *st = g_ctx != nullptr ? cmd->get_private_data<list_state>() : nullptr;
     if (st == nullptr)
         return false;
+    probe_scope probe(P_DRAW);
     if (!st->trace.empty())
         flush_trace(*st, "a dispatch of " + std::to_string(x) + "x" + std::to_string(y) + "x" + std::to_string(z) + " groups");
     // Skipping the dispatch is what keeps EASU from overwriting the frame.
     return st->delivery.pending && deliver(cmd, *st);
 }
-// With Debug on, once a frame from present: the device check and, every 600
-// frames, a summary of what happened since the last one.
+
+// Frame times, the probes and the GPU timestamps, gathered once a frame with
+// Debug on. A frame much slower than the ones before it is written out with
+// what the add-on spent on it.
+struct frame_stats
+{
+    uint64_t last_present = 0;
+    double average_ms = 0.0; // follows the scene, so a hitch stands out against it
+    std::vector<float> times;
+    uint32_t hitches = 0, hitches_logged = 0, dlss_frames = 0;
+    uint64_t seen_ns[P_COUNT] = {}, seen_calls[P_COUNT] = {};
+    double timestamp_hz = 0.0;
+    double gpu_ms[3] = {}, gpu_worst_ms[3] = {}, last_gpu_ms[3] = {};
+    uint32_t gpu_frames = 0;
+    // Video memory against the budget the driver gives the game. Past the
+    // budget, Windows starts moving memory out, which stalls the GPU.
+    IDXGIAdapter3 *adapter = nullptr;
+    double vram_gb = 0.0, budget_gb = 0.0, worst_vram_gb = 0.0;
+    uint32_t over_budget = 0;
+};
+frame_stats g_stats;
+
+const uint32_t MAX_HITCH_LINES = 20;
+const char *const GPU_SPANS[3] = {"input conversion", "DLSS", "sharpening and copies"};
+
+IDXGIAdapter3 *adapter_of(ID3D12Device *device)
+{
+    IDXGIFactory4 *factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))
+        return nullptr;
+    IDXGIAdapter3 *adapter = nullptr;
+    factory->EnumAdapterByLuid(device->GetAdapterLuid(), IID_PPV_ARGS(&adapter));
+    factory->Release();
+    return adapter;
+}
+
+void time_frame(context &c)
+{
+    frame_stats &f = g_stats;
+    const uint64_t now = now_ns();
+
+    if (f.adapter == nullptr)
+        f.adapter = adapter_of(reinterpret_cast<ID3D12Device *>(c.dev->get_native()));
+    DXGI_QUERY_VIDEO_MEMORY_INFO memory = {};
+    if (f.adapter != nullptr && SUCCEEDED(f.adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memory)))
+    {
+        f.vram_gb = double(memory.CurrentUsage) / double(1 << 30);
+        f.budget_gb = double(memory.Budget) / double(1 << 30);
+        f.worst_vram_gb = std::max(f.worst_vram_gb, f.vram_gb);
+        if (memory.CurrentUsage > memory.Budget)
+            ++f.over_budget;
+    }
+    const bool ran = c.last_replaced + 1 == c.frame;
+    if (ran)
+        ++f.dlss_frames;
+
+    if (f.timestamp_hz == 0.0 && c.queue != nullptr)
+    {
+        UINT64 hz = 0;
+        if (SUCCEEDED(reinterpret_cast<ID3D12CommandQueue *>(c.queue->get_native())->GetTimestampFrequency(&hz)))
+            f.timestamp_hz = double(hz);
+    }
+    uint64_t spans[gpu_timer::MARKS - 1];
+    if (f.timestamp_hz != 0.0 && c.frame > gpu_timer::RING && g_timer.read(c.frame - (gpu_timer::RING - 2), spans))
+    {
+        ++f.gpu_frames;
+        for (int i = 0; i < 3; ++i)
+        {
+            f.last_gpu_ms[i] = double(spans[i]) * 1000.0 / f.timestamp_hz;
+            f.gpu_ms[i] += f.last_gpu_ms[i];
+            f.gpu_worst_ms[i] = std::max(f.gpu_worst_ms[i], f.last_gpu_ms[i]);
+        }
+    }
+
+    // What the probes gathered since the last present, across all threads.
+    uint64_t frame_ns[P_COUNT], frame_calls[P_COUNT];
+    for (size_t p = 0; p < P_COUNT; ++p)
+    {
+        const uint64_t ns = g_probes[p].ns, calls = g_probes[p].calls;
+        frame_ns[p] = ns - f.seen_ns[p];
+        frame_calls[p] = calls - f.seen_calls[p];
+        f.seen_ns[p] = ns;
+        f.seen_calls[p] = calls;
+    }
+
+    if (f.last_present != 0)
+    {
+        const double ms = double(now - f.last_present) / 1e6;
+        f.times.push_back(float(ms));
+        const bool hitch = f.average_ms > 0.0 && ms > f.average_ms * 1.5 && ms > f.average_ms + 5.0;
+        if (hitch)
+        {
+            ++f.hitches;
+            if (f.hitches_logged < MAX_HITCH_LINES)
+            {
+                ++f.hitches_logged;
+                std::string line;
+                char part[96];
+                for (size_t p = 0; p < P_COUNT; ++p)
+                {
+                    if (frame_ns[p] < 100000)
+                        continue;
+                    snprintf(part, sizeof(part), "%s%s %.2f ms (%llu)", line.empty() ? "" : ", ", PROBE_NAMES[p],
+                             double(frame_ns[p]) / 1e6, static_cast<unsigned long long>(frame_calls[p]));
+                    line += part;
+                }
+                debug_event("slow frame: %.1f ms against %.1f ms, DLSS %s, video memory %.2f of %.2f GB; add-on CPU "
+                            "in it: %s; GPU last measured: %.2f / %.2f / %.2f ms",
+                            ms, f.average_ms, ran ? "on" : "off", f.vram_gb, f.budget_gb,
+                            line.empty() ? "under 0.1 ms everywhere" : line.c_str(), f.last_gpu_ms[0],
+                            f.last_gpu_ms[1], f.last_gpu_ms[2]);
+            }
+        }
+        f.average_ms = f.average_ms == 0.0 ? ms : f.average_ms * 0.95 + ms * 0.05;
+    }
+    f.last_present = now;
+}
+
+void summarize_frames()
+{
+    frame_stats &f = g_stats;
+    if (!f.times.empty())
+    {
+        std::vector<float> sorted = f.times;
+        std::sort(sorted.begin(), sorted.end());
+        double sum = 0.0;
+        for (float t : sorted)
+            sum += t;
+        debug_event("frame time: average %.2f ms, 1%% slowest from %.2f ms, worst %.2f ms, %u slow frames; DLSS ran "
+                    "in %u of %zu frames",
+                    sum / double(sorted.size()), sorted[sorted.size() * 99 / 100], sorted.back(), f.hitches,
+                    f.dlss_frames, sorted.size());
+    }
+
+    // Per frame on average, with the slowest single call.
+    const double frames = f.times.empty() ? 1.0 : double(f.times.size());
+    std::string line;
+    char part[128];
+    for (size_t p = 0; p < P_COUNT; ++p)
+    {
+        const uint64_t ns = g_probes[p].ns.exchange(0), calls = g_probes[p].calls.exchange(0);
+        const uint64_t worst = g_probes[p].worst_ns.exchange(0);
+        snprintf(part, sizeof(part), "%s%s %.3f ms in %.0f calls, slowest %.0f us", line.empty() ? "" : "; ",
+                 PROBE_NAMES[p], double(ns) / 1e6 / frames, double(calls) / frames, double(worst) / 1e3);
+        line += part;
+        f.seen_ns[p] = 0;
+        f.seen_calls[p] = 0;
+    }
+    debug_event("add-on CPU per frame: %s", line.c_str());
+
+    if (f.gpu_frames != 0)
+        debug_event("GPU per DLSS frame: %s %.3f ms (worst %.3f), %s %.3f ms (worst %.3f), %s %.3f ms (worst %.3f)",
+                    GPU_SPANS[0], f.gpu_ms[0] / f.gpu_frames, f.gpu_worst_ms[0], GPU_SPANS[1],
+                    f.gpu_ms[1] / f.gpu_frames, f.gpu_worst_ms[1], GPU_SPANS[2], f.gpu_ms[2] / f.gpu_frames,
+                    f.gpu_worst_ms[2]);
+
+    debug_event("video memory: %.2f GB now, highest %.2f GB, budget %.2f GB, over budget in %u frames", f.vram_gb,
+                f.worst_vram_gb, f.budget_gb, f.over_budget);
+
+    const uint64_t last_present = f.last_present;
+    const double average_ms = f.average_ms, timestamp_hz = f.timestamp_hz;
+    IDXGIAdapter3 *adapter = f.adapter;
+    f = frame_stats();
+    f.last_present = last_present;
+    f.average_ms = average_ms;
+    f.timestamp_hz = timestamp_hz;
+    f.adapter = adapter;
+    f.times.reserve(600);
+}
+
+// With Debug on, once a frame from present: the device check, the frame
+// timing and, every 600 frames, a summary of what happened since the last one.
 void debug_frame(context &c)
 {
+    time_frame(c);
+
     // A driver crash shows up here before anything else notices.
     static bool device_lost = false;
     const HRESULT removed = reinterpret_cast<ID3D12Device *>(c.dev->get_native())->GetDeviceRemovedReason();
@@ -1444,6 +2024,7 @@ void debug_frame(context &c)
     }
     if (c.frame % 600 != 0)
         return;
+    summarize_frames();
 
     const uint32_t replaced = g_counts.replaced.exchange(0);
     const uint64_t frame_us = g_counts.frame_us.exchange(0);
@@ -1481,7 +2062,11 @@ void debug_frame(context &c)
 
 void taa_register()
 {
+    reshade::register_event<reshade::addon_event::copy_descriptor_tables>(on_copy_tables_begin);
+    reshade::register_event<reshade::addon_event::update_descriptor_tables>(on_update_tables_begin);
     descriptor_tracking::register_events();
+    reshade::register_event<reshade::addon_event::copy_descriptor_tables>(on_copy_tables_end);
+    reshade::register_event<reshade::addon_event::update_descriptor_tables>(on_update_tables_end);
     reshade::register_event<reshade::addon_event::init_device>(on_init_device);
     reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
     reshade::register_event<reshade::addon_event::init_pipeline_layout>(on_init_pipeline_layout);
@@ -1503,7 +2088,11 @@ void taa_register()
 
 void taa_unregister()
 {
+    reshade::unregister_event<reshade::addon_event::copy_descriptor_tables>(on_copy_tables_begin);
+    reshade::unregister_event<reshade::addon_event::update_descriptor_tables>(on_update_tables_begin);
     descriptor_tracking::unregister_events();
+    reshade::unregister_event<reshade::addon_event::copy_descriptor_tables>(on_copy_tables_end);
+    reshade::unregister_event<reshade::addon_event::update_descriptor_tables>(on_update_tables_end);
 }
 
 void taa_present(command_queue *queue, uint32_t display_width, uint32_t display_height)

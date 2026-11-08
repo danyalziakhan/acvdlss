@@ -5,12 +5,17 @@
 // Valhalla's texture samplers are static samplers inside its D3D12 root
 // signatures, so there is nothing to swap at bind time. The bias goes in as the
 // game creates them, since ReShade raises create_sampler for static samplers
-// too. That has two consequences. The bias follows the resolution scale the game saved, so a new
-// scale takes a restart. And the game's pipeline cache does not notice a
-// changed static sampler: it keeps handing out pipelines built with the old
-// one, which once left interiors without their indirect light. So whenever the
-// bias changes, the cache is cleared before the game opens it, and the game
-// spends one slow start rebuilding it.
+// too. That has two consequences. The bias follows the resolution scale the
+// game saved, so a new scale takes a restart. And the game's pipeline cache
+// does not notice a changed static sampler: it keeps handing out pipelines
+// built with the old one, which once left interiors without their indirect
+// light. So whenever the bias changes, the cache is cleared before the game
+// opens it, and the game spends one slow start rebuilding it.
+//
+// A rebuild cut short leaves a cache that is just as broken: shadows that
+// blink and blotch, a banded sky. So the note in the cache says "building"
+// until a session that rebuilt it ends normally after REBUILD_TIME, and a
+// start that still finds "building" clears it again.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -23,6 +28,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cwchar>
@@ -42,8 +48,16 @@ namespace
 // rebuilt for a new rule just as for a new value.
 const int RULE_VERSION = 1;
 
+// Long enough for the game to have built its pipelines and reached gameplay.
+const auto REBUILD_TIME = std::chrono::minutes(3);
+
 float g_bias = 0.0f;
 std::atomic<uint32_t> g_biased{0};
+
+std::filesystem::path g_note; // inside the cache, so it goes when the cache does
+std::string g_finished;       // what the note says once the rebuild is done
+bool g_building = false;      // this session cleared the cache
+std::chrono::steady_clock::time_point g_started;
 
 std::filesystem::path game_documents()
 {
@@ -88,38 +102,42 @@ std::string read_file(const std::filesystem::path &path)
     return text;
 }
 
-// Clears the game's pipeline cache when the bias it was built with differs
-// from the one about to be applied. The bias it was built with is noted in a
-// file inside the cache, so it goes when the cache does. Runs while the
-// add-on loads, before the game has a device to build pipelines with.
+// Clears the game's pipeline cache unless it was fully built with the bias
+// about to be applied. Runs while the add-on loads, before the game has a
+// device to build pipelines with.
 void match_pipeline_cache(const std::filesystem::path &folder)
 {
     const std::filesystem::path cache = folder / L"cache";
-    const std::filesystem::path note = cache / L"acvdlss.bias";
-    char wanted[48];
-    snprintf(wanted, sizeof(wanted), "rule %d, bias %.2f", RULE_VERSION, g_bias);
+    g_note = cache / L"acvdlss.bias";
+    char finished[48];
+    snprintf(finished, sizeof(finished), "rule %d, bias %.2f", RULE_VERSION, g_bias);
+    g_finished = finished;
 
+    const std::string note = read_file(g_note);
+    if (note == g_finished)
+        return;
+
+    const char *why = note.empty()                      ? "it has no note from this add-on"
+                      : note == "building, " + g_finished ? "its last rebuild did not finish"
+                                                          : "the LOD bias changed";
     std::error_code error;
-    if (!std::filesystem::exists(cache, error) || read_file(note) == wanted)
+    if (std::filesystem::exists(cache, error))
     {
-        // A missing cache is built fresh with this bias anyway.
-        std::filesystem::create_directories(cache, error);
-        std::ofstream(note) << wanted << '\n';
-        return;
-    }
-
-    std::filesystem::remove_all(cache, error);
-    if (error)
-    {
-        reshade::log::message(reshade::log::level::warning,
-                              "ACV DLSS: could not clear the game's pipeline cache; the LOD bias stays off");
-        g_bias = 0.0f;
-        return;
+        std::filesystem::remove_all(cache, error);
+        if (error)
+        {
+            reshade::log::message(reshade::log::level::warning,
+                                  "ACV DLSS: could not clear the game's pipeline cache; the LOD bias stays off");
+            g_bias = 0.0f;
+            return;
+        }
+        const std::string text =
+            std::string("ACV DLSS: cleared the game's pipeline cache because ") + why + "; this start will be slow";
+        reshade::log::message(reshade::log::level::info, text.c_str());
     }
     std::filesystem::create_directories(cache, error);
-    std::ofstream(note) << wanted << '\n';
-    reshade::log::message(reshade::log::level::info,
-                          "ACV DLSS: cleared the game's pipeline cache for a new LOD bias; this start will be slow");
+    std::ofstream(g_note) << "building, " << g_finished << '\n';
+    g_building = true;
 }
 
 // Material textures only: they tile, so their samplers wrap, and they are
@@ -167,6 +185,7 @@ bool on_create_sampler(device *dev, sampler_desc &desc)
 
 void lod_register()
 {
+    g_started = std::chrono::steady_clock::now();
     const std::filesystem::path folder = game_documents();
     if (folder.empty())
         return;
@@ -175,6 +194,23 @@ void lod_register()
     g_bias = lod_bias_for(saved_render_scale(folder));
     match_pipeline_cache(folder);
     reshade::register_event<reshade::addon_event::create_sampler>(on_create_sampler);
+}
+
+// Called as the add-on unloads, which a crash or a killed process skips. The
+// C++ runtime may already be going away, so the note is written with Win32.
+void lod_session_end()
+{
+    if (!g_building || std::chrono::steady_clock::now() - g_started < REBUILD_TIME)
+        return;
+    const HANDLE file =
+        CreateFileW(g_note.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        return;
+    const std::string text = g_finished + "\n";
+    DWORD written = 0;
+    WriteFile(file, text.data(), DWORD(text.size()), &written, nullptr);
+    CloseHandle(file);
+    g_building = false;
 }
 
 // NVIDIA's DLSS programming guide: log2(render width / output width) - 1.

@@ -13,11 +13,11 @@ recognizes that table when the game binds it, and on the next draw it:
 
 1. unpacks the motion vectors and converts depth into what DLSS expects
 2. runs DLSS with the jitter and camera from the game's own constant buffers
-3. sharpens the result with RCAS if asked
-4. copies it into the render target the TAA would have written
+3. sharpens the result with RCAS (optional)
+4. copies it into the TAA's own output texture
 
-The game's TAA draws are then skipped. Everything drawn after that works on the
-DLSS image, including the HUD.
+It skips the game's TAA and everything drawn after that works on the DLSS
+image, including the HUD.
 
 ## Resolution scale
 
@@ -30,21 +30,20 @@ The game's **Resolution Scale** setting decides what DLSS does:
   get a render-size copy.
 - **Above 100%** DLSS runs as DLAA at the larger size and the game scales it
   down as usual.
-
-With **FSR** as the game's upscaler, DLSS takes FSR 1's place and FSR 1's
-sharpening is skipped.
+- **FSR** as the game's upscaler works too. DLSS takes FSR 1's place and FSR
+  1's sharpening is skipped. See below for why it's better left off.
 
 Textures get the negative mip LOD bias NVIDIA recommends, which is
 log2(render / output) - 1. That is -1 at 100% and above and about -1.5 at
 70%. Only tiling material textures get it, never screen effects such as
 exposure.
 
-The game builds the bias into its pipelines at start up, so restart the game
-after changing the resolution scale. Until you do, the window shows the new
-bias in amber. The first start with the add-on and the first start after a
-change take longer than usual while the game rebuilds its pipeline cache. Let
-it finish, because closing the game during the rebuild can leave a broken cache
-behind.
+DLSS picks up a new resolution scale straight away. The LOD bias needs a full
+game restart because the game builds it into its pipelines at start up. Until
+then the window shows the new bias in amber. The first start with the add-on
+and the first start after a change take longer than usual while the game
+rebuilds its pipeline cache. Let it finish, because closing the game during
+the rebuild can leave a broken cache behind.
 
 ## Installing
 
@@ -63,9 +62,11 @@ what DLSS is doing right now and the current LOD bias.
 ![The ACV DLSS window, running DLAA at 1920x1200](screenshots/window.png)
 
 - **Enabled** switches between DLSS and the game's own TAA.
-- **Toggle key** does the same while playing. It's F10 by default. Click the
-  button and press another key to change it. Esc cancels and Backspace leaves
-  it without a key. Keys ReShade already uses are skipped.
+- **Toggle key** does the same while playing. It's F10 by default but you can
+  map it to any key: click the button and press the key. Esc cancels and
+  Backspace leaves it without a key. Keys ReShade already uses are skipped.
+  Each switch displays "DLSS: On" or "DLSS: Off" in the top-left corner for a
+  few seconds.
 - **Preset** chooses the DLSS model. **Auto** lets DLSS pick the one NVIDIA
   recommends for your card. J and K are the first generation of transformer
   models and L and M the second. E and F are the older CNN models. NVIDIA
@@ -76,19 +77,27 @@ what DLSS is doing right now and the current LOD bias.
 
 - **Sharpness** applies AMD's RCAS to the DLSS image before the HUD is drawn.
 
-Each switch shows "DLSS: On" or "DLSS: Off" in the top left corner for a few
-seconds. Settings are saved to `ReShade.ini` under `[ACVDLSS]`.
+Settings are saved to `ReShade.ini` under `[ACVDLSS]`.
 
 ## Good to know
 
 - Menus and loading screens show the game's own image because the game draws
-  them without TAA. DLSS takes over again once you're back in the game.
+  them without TAA.
 - Dialogue cutscenes work with DLSS too, including the letterboxed ones.
 - ShortFuse's RenoDX DLSS works well with it. Its **Render** and **Upscaled**
   hook methods apply DLSS 5 neural rendering inside the DLSS pass with the
-  game's motion vectors. Applied to the final image instead, it is less stable
-  without them.
-- Don't combine it with another mod that replaces the game's anti-aliasing.
+  game's motion vectors, which gives more stable results than applying it to
+  the final image.
+- Don't combine it with any other mod that replaces the game's anti-aliasing.
+
+## Why FSR is better left off
+
+The game's FSR stacks on top of the resolution scale, so 70% with FSR
+Performance renders at only 35% of your screen. The game's camera cycles
+through just 8 sub-pixel positions, which is enough for DLSS at 70% and above
+but not at very low render sizes, where foliage and shadows shimmer until DLSS
+settles. Turn FSR off and use the resolution scale to set the render size
+instead.
 
 ## Building
 
@@ -141,13 +150,11 @@ Output: `build\Release\acvdlss.addon64`.
 - `shaders\rcas.hlsl` follows RCAS from AMD FidelityFX Super Resolution 1, MIT,
   copyright Advanced Micro Devices, Inc.
 
-Not affiliated with NVIDIA, AMD, Ubisoft or the ReShade project.
-
 ## Acknowledgements
 
 The DLSS mods for [Assassin's Creed Odyssey](https://www.nexusmods.com/assassinscreedodyssey/mods/466)
 and [Assassin's Creed Origins](https://www.nexusmods.com/assassinscreedorigins/mods/339)
-were the inspiration for this add-on.
+were the inspiration for this mod.
 
 ## Development note
 

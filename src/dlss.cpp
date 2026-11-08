@@ -68,13 +68,19 @@ bool dlss::init(ID3D12Device *device, bool log)
         info.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_ON;
     }
 
+    // NGX does not say when the DLL is missing, only that DLSS is, so the file
+    // is looked for here to give the likeliest reason first.
+    const std::wstring dll = folder + L"\\nvngx_dlss.dll";
+    const bool dll_missing = GetFileAttributesW(dll.c_str()) == INVALID_FILE_ATTRIBUTES;
+    const char *const MISSING = "nvngx_dlss.dll is not in the game folder";
+
     NVSDK_NGX_Result result = NVSDK_NGX_D3D12_Init_with_ProjectID(
         PROJECT_ID, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0", folder.c_str(), device, &info);
     if (NVSDK_NGX_FAILED(result))
     {
-        _error = result == NVSDK_NGX_Result_FAIL_FeatureNotSupported
-                     ? "this graphics card does not support DLSS"
-                     : describe("NGX start-up", result);
+        _error = result == NVSDK_NGX_Result_FAIL_FeatureNotSupported ? "this graphics card does not support DLSS"
+                 : dll_missing                                       ? MISSING
+                                                                     : describe("NGX start-up", result);
         return false;
     }
 
@@ -91,8 +97,9 @@ bool dlss::init(ID3D12Device *device, bool log)
     NVSDK_NGX_Parameter_GetI(_params, NVSDK_NGX_Parameter_SuperSampling_Available, &supported);
     if (needs_driver || !supported)
     {
-        _error = needs_driver ? "the graphics driver is too old for DLSS"
-                              : "DLSS is not available; is nvngx_dlss.dll next to the game?";
+        _error = needs_driver  ? "the graphics driver is too old for DLSS"
+                 : dll_missing ? MISSING
+                               : "it needs an NVIDIA RTX graphics card and a recent nvngx_dlss.dll";
         NVSDK_NGX_D3D12_DestroyParameters(_params);
         _params = nullptr;
         return false;
