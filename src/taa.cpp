@@ -290,12 +290,12 @@ void debug_event(const char *format, ...)
 {
     if (!g_settings.debug)
         return;
-    char text[256] = "ACV DLSS: ";
+    char text[256];
     va_list args;
     va_start(args, format);
-    vsnprintf(text + 10, sizeof(text) - 10, format, args);
+    vsnprintf(text, sizeof(text), format, args);
     va_end(args);
-    reshade::log::message(reshade::log::level::info, text);
+    acv_log(reshade::log::level::info, text);
 }
 
 //----------------------------------------------------------------------------
@@ -668,30 +668,43 @@ std::string describe(const texture_entry &e)
     return text;
 }
 
-// With Debug on: a table that holds a frame-size depth texture and enough
-// others to be the TAA, but did not match. Each is written to the log once.
-void log_near_miss(const list_state &st, uint32_t param, const texture_entry *entries, size_t n)
+// Tables that hold a frame-size depth texture and enough others to be the TAA,
+// but did not match, each noted once. With Debug on they are logged as they
+// come; otherwise the first few are kept for the note that the TAA pass was
+// never found, which is what a "waiting for the game's anti-aliasing" report
+// needs.
+std::mutex g_near_miss_lock;
+std::unordered_set<uint64_t> g_near_miss_seen;
+std::vector<std::string> g_near_misses;
+
+void note_near_miss(const list_state &st, uint32_t param, const texture_entry *entries, size_t n)
 {
-    static std::mutex lock;
-    static std::unordered_set<uint64_t> seen;
     const bool has_depth = std::any_of(entries, entries + n, [](const texture_entry &e) {
         return e.fmt == format::r32_float && e.width >= 1280;
     });
     if (n < 6 || !has_depth)
         return;
     {
-        std::lock_guard guard(lock);
-        if (seen.size() >= 32 || !seen.insert(st.graphics.layout.handle ^ (uint64_t(param) << 48)).second)
+        std::lock_guard guard(g_near_miss_lock);
+        if (g_near_miss_seen.size() >= 32 ||
+            !g_near_miss_seen.insert(st.graphics.layout.handle ^ (uint64_t(param) << 48)).second)
             return;
     }
 
     char head[96];
-    snprintf(head, sizeof(head), "ACV DLSS: no match for root signature %p, parameter %u:",
-             reinterpret_cast<void *>(st.graphics.layout.handle), param);
+    snprintf(head, sizeof(head), "root signature %p, parameter %u:", reinterpret_cast<void *>(st.graphics.layout.handle),
+             param);
     std::string line = head;
     for (size_t i = 0; i < n; ++i)
         line += " [" + describe(entries[i]) + (entries[i].texture_2d ? "" : " not 2D") + "]";
-    reshade::log::message(reshade::log::level::info, line.c_str());
+    if (g_settings.debug)
+    {
+        acv_log(reshade::log::level::info, ("close to the TAA's table but not it, " + line).c_str());
+        return;
+    }
+    std::lock_guard guard(g_near_miss_lock);
+    if (g_near_misses.size() < 8)
+        g_near_misses.push_back(line);
 }
 
 uint64_t site_key(pipeline_layout layout, uint32_t param)
@@ -773,8 +786,7 @@ void try_match(command_list *cmd, list_state &st, uint32_t param, descriptor_tab
     const int at = match_taa(entries, n);
     if (at < 0)
     {
-        if (g_settings.debug)
-            log_near_miss(st, param, entries, n);
+        note_near_miss(st, param, entries, n);
         return;
     }
     ++g_tables_matched;
@@ -849,7 +861,7 @@ void trace_reads(command_list *cmd, list_state &st, bool graphics, uint32_t para
     }
 
     char head[128];
-    snprintf(head, sizeof(head), "ACV DLSS: %s pass reads the TAA output; root signature %p, parameter %u; reads",
+    snprintf(head, sizeof(head), "%s pass reads the TAA output (root signature %p, parameter %u); reads",
              graphics ? "graphics" : "compute", reinterpret_cast<void *>(root.layout.handle), param);
     st.trace = head + reads + (writes.empty() ? std::string() : "; writes" + writes);
 }
@@ -858,7 +870,7 @@ void flush_trace(list_state &st, const std::string &what)
 {
     if (st.trace.empty())
         return;
-    reshade::log::message(reshade::log::level::info, (st.trace + "; then " + what).c_str());
+    acv_log(reshade::log::level::info, (st.trace + "; then " + what).c_str());
     st.trace.clear();
 }
 
@@ -1113,13 +1125,11 @@ void apply_redirect(command_list *cmd, list_state &st)
             return;
         g_upscale.sites.push_back({st.graphics.layout.handle, r.param, r.binding});
         g_screen_sites.add(site_key(st.graphics.layout, r.param));
-        if (g_settings.debug)
-        {
-            char text[128];
-            snprintf(text, sizeof(text), "ACV DLSS: screen pass found, root signature %p, parameter %u, slot %u",
-                     reinterpret_cast<void *>(st.graphics.layout.handle), r.param, r.binding);
-            reshade::log::message(reshade::log::level::info, text);
-        }
+        char text[160];
+        snprintf(text, sizeof(text),
+                 "found the pass that scales the frame to the screen (root signature %p, parameter %u, slot %u)",
+                 reinterpret_cast<void *>(st.graphics.layout.handle), r.param, r.binding);
+        acv_log(reshade::log::level::info, text);
     }
 
     descriptor_heap heap = {0};
@@ -1243,7 +1253,9 @@ bool deliver(command_list *cmd, list_state &st)
         if (d.new_site)
         {
             keep_discovering(g_upscale);
-            debug_event("FSR 1 pass replaced, its output is %ux%u", d.width, d.height);
+            char text[96];
+            snprintf(text, sizeof(text), "found an FSR 1 pass; DLSS fills its %ux%u output instead", d.width, d.height);
+            acv_log(reshade::log::level::info, text);
         }
     }
 
@@ -1262,11 +1274,9 @@ bool deliver(command_list *cmd, list_state &st)
     return true;
 }
 
-// With Debug on, says once why the TAA pass was left to the game.
+// Says once per reason why a TAA pass that was found was left to the game.
 bool give_up(const std::string &reason)
 {
-    if (!g_settings.debug)
-        return false;
     ++g_counts.given_up;
     static std::mutex lock;
     static std::unordered_set<std::string> said;
@@ -1275,7 +1285,7 @@ bool give_up(const std::string &reason)
         if (said.size() >= 32 || !said.insert(reason).second)
             return false;
     }
-    reshade::log::message(reshade::log::level::info, ("ACV DLSS: TAA pass left to the game: " + reason).c_str());
+    acv_log(reshade::log::level::info, ("left a TAA pass to the game: " + reason).c_str());
     return false;
 }
 
@@ -1366,8 +1376,8 @@ bool replace(command_list *cmd, list_state &st)
         if (logged_size.exchange(size) != size)
         {
             char text[96];
-            snprintf(text, sizeof(text), "ACV DLSS: TAA pass at %ux%u, color format %u", width, height, unsigned(color.fmt));
-            reshade::log::message(reshade::log::level::info, text);
+            snprintf(text, sizeof(text), "TAA pass at %ux%u, color format %u", width, height, unsigned(color.fmt));
+            acv_log(reshade::log::level::info, text);
         }
     }
 
@@ -1401,10 +1411,21 @@ bool replace(command_list *cmd, list_state &st)
     const bool upscale = c.display_width > width && c.display_height > height;
     const uint32_t output_width = upscale ? c.display_width : width;
     const uint32_t output_height = upscale ? c.display_height : height;
-    if (output_width != c.status.output_width || output_height != c.status.output_height ||
-        c.status.state != taa_state::running)
-        debug_event("%s %ux%u to %ux%u, screen %ux%u%s", upscale ? "upscaling" : "DLAA", width, height, output_width,
-                    output_height, c.display_width, c.display_height, hdr ? ", HDR" : "");
+    // Once per mode, so it is logged without Debug too.
+    static uint64_t logged_mode = 0;
+    const uint64_t mode = (uint64_t(width) << 48) ^ (uint64_t(height) << 32) ^ (uint64_t(output_width) << 16) ^
+                          output_height ^ (hdr ? 1ull << 63 : 0);
+    if (mode != logged_mode)
+    {
+        logged_mode = mode;
+        char text[128];
+        if (upscale)
+            snprintf(text, sizeof(text), "DLSS running: %ux%u upscaled to %ux%u%s", width, height, output_width,
+                     output_height, hdr ? ", HDR" : "");
+        else
+            snprintf(text, sizeof(text), "DLSS running: DLAA at %ux%u%s", width, height, hdr ? ", HDR" : "");
+        acv_log(reshade::log::level::info, text);
+    }
     c.status.output_width = output_width;
     c.status.output_height = output_height;
     c.status.display_width = c.display_width;
@@ -1480,7 +1501,8 @@ bool replace(command_list *cmd, list_state &st)
         restore(dev, list, st);
         c.failed = true;
         set_status(c, taa_state::failed, c.upscaler.error());
-        reshade::log::message(reshade::log::level::error, ("ACV DLSS: " + c.upscaler.error()).c_str());
+        acv_log(reshade::log::level::error,
+                ("DLSS failed, the game's TAA is back until a restart: " + c.upscaler.error()).c_str());
         return false;
     }
 
@@ -1520,22 +1542,25 @@ void on_init_device(device *dev)
     auto c = std::make_unique<context>();
     c->dev = dev;
     auto *native = reinterpret_cast<ID3D12Device *>(dev->get_native());
+    log_adapter(native);
     if (!c->upscaler.init(native, g_settings.debug))
         c->error = c->upscaler.error();
     else if (!c->work.init(native))
         c->error = c->work.error();
     else
         c->ready = true;
+    // After NGX has started, so its modules are in the list too.
+    log_modules();
 
     if (c->ready)
     {
         set_status(*c, taa_state::waiting);
-        reshade::log::message(reshade::log::level::info, "ACV DLSS: DLSS is ready");
+        acv_log(reshade::log::level::info, "DLSS is ready, waiting for the game's TAA pass");
     }
     else
     {
         set_status(*c, taa_state::unavailable, c->error);
-        reshade::log::message(reshade::log::level::warning, ("ACV DLSS: " + c->error).c_str());
+        acv_log(reshade::log::level::warning, ("DLSS can't start: " + c->error).c_str());
     }
     g_ctx = std::move(c);
 }
@@ -2006,22 +2031,46 @@ void summarize_frames()
     f.times.reserve(600);
 }
 
-// With Debug on, once a frame from present: the device check, the frame
-// timing and, every 600 frames, a summary of what happened since the last one.
-void debug_frame(context &c)
+// Once a frame in every build: a lost device, and a TAA pass that never turns
+// up. Both are cheap and both are what a report about a crash or about
+// "waiting for the game's anti-aliasing" needs.
+void check_device(context &c)
 {
-    time_frame(c);
-
-    // A driver crash shows up here before anything else notices.
+    // A driver crash or timeout shows up here before anything else notices.
     static bool device_lost = false;
     const HRESULT removed = reinterpret_cast<ID3D12Device *>(c.dev->get_native())->GetDeviceRemovedReason();
     if (!device_lost && FAILED(removed))
     {
         device_lost = true;
         char text[96];
-        snprintf(text, sizeof(text), "ACV DLSS: the graphics device was removed, reason 0x%08lX", static_cast<unsigned long>(removed));
-        reshade::log::message(reshade::log::level::error, text);
+        snprintf(text, sizeof(text), "the graphics device was lost (0x%08lX)", static_cast<unsigned long>(removed));
+        acv_log(reshade::log::level::error, text);
     }
+
+    // The menus have no TAA, so a minute without one is said once, with the
+    // tables that came closest, and only if DLSS never ran at all.
+    const uint64_t NOTE_FRAMES = 3600;
+    if (c.frame != NOTE_FRAMES || !c.ready || c.failed || !g_settings.enabled || g_taa_frame != 0)
+        return;
+    std::string text = "no TAA pass found in the first " + std::to_string(NOTE_FRAMES) +
+                       " frames. Normal while in the menus; in play it means the game's Anti-aliasing is not on "
+                       "High or another mod replaces it.";
+    std::lock_guard guard(g_near_miss_lock);
+    if (g_near_misses.empty())
+        text += " No table came close.";
+    else
+        text += " Tables that came closest:";
+    acv_log(reshade::log::level::info, text.c_str());
+    for (const std::string &line : g_near_misses)
+        acv_log(reshade::log::level::info, ("  " + line).c_str());
+}
+
+// With Debug on, once a frame from present: the frame timing and, every 600
+// frames, a summary of what happened since the last one.
+void debug_frame(context &c)
+{
+    time_frame(c);
+
     if (c.frame % 600 != 0)
         return;
     summarize_frames();
@@ -2033,7 +2082,7 @@ void debug_frame(context &c)
                 replaced, replaced != 0 ? double(frame_us) / 1000.0 / replaced : 0.0, g_counts.resets.exchange(0),
                 g_counts.camera_only.exchange(0), g_counts.skipped_draws.exchange(0), g_counts.redirects.exchange(0),
                 g_counts.deliveries.exchange(0), g_counts.given_up.exchange(0));
-    debug_event("now: %s, %ux%u to %ux%u, preset %u, sharpness %.0f%%, LOD bias %+.2f on %u samplers",
+    debug_event("state: %s, %ux%u to %ux%u, preset %u, sharpness %.0f%%, LOD bias %+.2f on %u samplers",
                 c.status.state == taa_state::running ? "running" : "not running", c.status.width, c.status.height,
                 c.status.output_width, c.status.output_height, unsigned(g_settings.preset),
                 g_settings.sharpness * 100.0f, lod_bias(), lod_biased_samplers());
@@ -2113,6 +2162,7 @@ static bool present_frame(command_queue *queue, uint32_t display_width, uint32_t
         stop_upscaling();
     ++c.frame;
     c.work.collect(c.frame);
+    check_device(c);
     if (g_settings.debug)
         debug_frame(c);
     if (!c.ready || c.failed)

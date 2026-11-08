@@ -15,8 +15,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstdio>
 #include <iterator>
 #include <string>
@@ -60,23 +62,61 @@ static int g_toggle_key = VK_F10;
 static bool g_listening = false;
 static int g_listen_frame = 0; // ImGui frame the key button was last drawn on
 
+static void save_preset(uint32_t preset)
+{
+    const char letter[2] = {char('A' + preset - 1), '\0'};
+    reshade::set_config_value(nullptr, SECTION, "Preset", preset == 0 ? "Auto" : letter);
+}
+
+// Saved as the preset's letter, or Auto. Earlier versions saved NVIDIA's
+// number, which is read once and saved back as the letter.
+static uint32_t read_preset()
+{
+    char value[16] = "";
+    size_t size = sizeof(value);
+    if (!reshade::get_config_value(nullptr, SECTION, "Preset", value, &size))
+        return 0;
+    if (value[0] >= '0' && value[0] <= '9')
+    {
+        const unsigned long number = strtoul(value, nullptr, 10);
+        const uint32_t preset = number < std::size(PRESETS) ? uint32_t(number) : 0;
+        save_preset(preset);
+        return preset;
+    }
+    const char letter = char(toupper(static_cast<unsigned char>(value[0])));
+    if (value[1] == '\0' && letter >= 'A' && letter < char('A' + std::size(PRESETS) - 1))
+        return uint32_t(letter - 'A' + 1);
+    return 0;
+}
+
 static void load_settings()
 {
     bool enabled = true, debug = false;
-    uint32_t preset = 0;
     int sharpness = 0;
     reshade::get_config_value(nullptr, SECTION, "Enabled", enabled);
-    reshade::get_config_value(nullptr, SECTION, "Preset", preset);
+    const uint32_t preset = read_preset();
     reshade::get_config_value(nullptr, SECTION, "Sharpness", sharpness);
     reshade::get_config_value(nullptr, SECTION, "Debug", debug);
     g_settings.enabled = enabled;
     g_settings.debug = debug;
-    g_settings.preset = preset < std::size(PRESETS) ? preset : 0;
+    g_settings.preset = preset;
     g_settings.sharpness = float(std::clamp(sharpness, 0, 100)) / 100.0f;
 
     int key = g_toggle_key;
     reshade::get_config_value(nullptr, SECTION, "ToggleKey", key);
     g_toggle_key = key >= 0 && key < 256 ? key : VK_F10;
+}
+
+static std::string key_name(uint32_t vk);
+
+static void log_settings()
+{
+    char text[160];
+    snprintf(text, sizeof(text), "settings: %s, preset %s, sharpness %d%%, toggle key %s%s",
+             g_settings.enabled ? "on" : "off", PRESETS[g_settings.preset],
+             int(std::lround(g_settings.sharpness * 100.0f)),
+             g_toggle_key != 0 ? key_name(g_toggle_key).c_str() : "none", g_settings.debug ? ", Debug on" : "");
+    acv_log(reshade::log::level::info, text);
 }
 
 static void save_toggle_key()
@@ -89,22 +129,20 @@ static void save_toggle_key()
 static const auto INDICATOR_TIME = std::chrono::seconds(3);
 static std::chrono::steady_clock::time_point g_indicator_until;
 
-// With Debug on, settings changes go to the log beside what they caused.
+// Settings changes go to the log beside what they caused.
 static void log_change(const char *format, ...)
 {
-    if (!g_settings.debug)
-        return;
-    char text[160] = "ACV DLSS: ";
+    char text[160];
     va_list args;
     va_start(args, format);
-    vsnprintf(text + 10, sizeof(text) - 10, format, args);
+    vsnprintf(text, sizeof(text), format, args);
     va_end(args);
-    reshade::log::message(reshade::log::level::info, text);
+    acv_log(reshade::log::level::info, text);
 }
 
 static void set_enabled(bool enabled, const char *how)
 {
-    log_change("switched %s by %s", enabled ? "on" : "off", how);
+    log_change("DLSS switched %s with %s", enabled ? "on" : "off", how);
     g_settings.enabled = enabled;
     reshade::set_config_value(nullptr, SECTION, "Enabled", enabled);
     if (enabled)
@@ -225,6 +263,7 @@ static void draw_toggle_key(effect_runtime *runtime)
         {
             g_toggle_key = vk == VK_BACK ? 0 : vk;
             save_toggle_key();
+            log_change("toggle key set to %s", g_toggle_key != 0 ? key_name(g_toggle_key).c_str() : "none");
         }
         g_listening = false;
         break;
@@ -247,14 +286,23 @@ static std::string describe_mode(const taa_status &s)
     return std::string(text) + (s.hdr ? ", HDR" : "");
 }
 
-// The bias the game has now, and the one a restart would bring if the
-// resolution scale changed since it started.
-static void draw_lod_bias(const taa_status &s)
+// The bias the game has now, and the one a restart would bring if FSR was
+// switched or changed since it started. Without FSR there is no bias, so the
+// line only shows when one of the two isn't 0. The settings file is read at
+// most once a second.
+static void draw_lod_bias()
 {
-    ImGui::TextDisabled("LOD bias: %+.2f", lod_bias());
-    if (s.state != taa_state::running || s.display_width == 0 || lod_bias() == 0.0f)
+    static float wanted = lod_bias();
+    static auto read = std::chrono::steady_clock::time_point();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - read >= std::chrono::seconds(1))
+    {
+        wanted = lod_bias_saved();
+        read = now;
+    }
+    if (lod_bias() == 0.0f && wanted == 0.0f)
         return;
-    const float wanted = lod_bias_for(float(s.width) / float(s.display_width));
+    ImGui::TextDisabled("LOD bias: %+.2f", lod_bias());
     if (std::abs(wanted - lod_bias()) > 0.01f)
     {
         ImGui::SameLine();
@@ -305,7 +353,13 @@ static void draw_window(effect_runtime *runtime)
     const float top = ImGui::GetCursorPosY();
     const taa_status s = taa_get_status();
     draw_status(s);
-    draw_lod_bias(s);
+    draw_lod_bias();
+    if (const std::string warning = dlss_versions_warning(); !warning.empty())
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text, WARNING_COLOR);
+        ImGui::TextWrapped("%s", warning.c_str());
+        ImGui::PopStyleColor();
+    }
     ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY(), top + STATUS_LINES * ImGui::GetTextLineHeightWithSpacing()));
     ImGui::Separator();
 
@@ -318,8 +372,8 @@ static void draw_window(effect_runtime *runtime)
     if (ImGui::Combo("Preset", &preset, PRESETS, int(std::size(PRESETS))))
     {
         g_settings.preset = uint32_t(preset);
-        reshade::set_config_value(nullptr, SECTION, "Preset", preset);
-        log_change("preset %s", PRESETS[preset]);
+        save_preset(uint32_t(preset));
+        log_change("preset set to %s", PRESETS[preset]);
     }
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Auto lets DLSS choose the model NVIDIA recommends for your graphics card.");
@@ -335,7 +389,7 @@ static void draw_window(effect_runtime *runtime)
     if (ImGui::IsItemActivated())
         dragged_from = sharpness;
     if (ImGui::IsItemDeactivatedAfterEdit() && sharpness != dragged_from)
-        log_change("sharpness %d%%", sharpness);
+        log_change("sharpness set to %d%%", sharpness);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("AMD's RCAS, run on the DLSS output before the HUD is drawn.");
 }
@@ -410,13 +464,13 @@ static void on_present(effect_runtime *runtime)
     static uint32_t logged_width = 0, logged_height = 0;
     uint32_t width = 0, height = 0;
     runtime->get_screenshot_width_and_height(&width, &height);
-    if (g_settings.debug && (width != logged_width || height != logged_height))
+    if (width != logged_width || height != logged_height)
     {
         logged_width = width;
         logged_height = height;
         char text[64];
-        snprintf(text, sizeof(text), "ACV DLSS: back buffer %ux%u", width, height);
-        reshade::log::message(reshade::log::level::info, text);
+        snprintf(text, sizeof(text), "screen is %ux%u", width, height);
+        acv_log(reshade::log::level::info, text);
     }
 
     // With the overlay open the key could be typed into a text box instead.
@@ -435,6 +489,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         if (!reshade::register_addon(module))
             return FALSE;
         load_settings();
+        log_start();
+        log_settings();
         lod_register();
         taa_register();
         reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);

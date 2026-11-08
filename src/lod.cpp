@@ -1,6 +1,13 @@
-// Negative mip LOD bias for the game's material textures, so they keep the
-// detail of the output resolution rather than the render resolution. The value
-// is NVIDIA's: log2(render width / output width) - 1.
+// Negative mip LOD bias for the game's material textures, as far as the game
+// streams them. The engine picks the texture detail it loads, and the detail
+// it bakes into the ground's texture pages, for the resolution scale's size,
+// not for the size FSR renders inside it. Asking for finer detail than that
+// reads mips that are not loaded, and the ground pages that bake from them
+// come out black up close. So the bias is log2(FSR's render size / the
+// resolution scale's size): 0 with FSR off, -1 with FSR Performance. That
+// gives the textures the full detail of the size DLSS outputs at when the
+// resolution scale is 100%. NVIDIA's guide adds another -1 on top, which is
+// exactly what read past the loaded mips here, at any resolution.
 //
 // Valhalla's texture samplers are static samplers inside its D3D12 root
 // signatures, so there is nothing to swap at bind time. The bias goes in as the
@@ -46,9 +53,10 @@ using namespace reshade::api;
 
 namespace
 {
-// Goes up whenever wants_bias() picks different samplers, so the cache is
-// rebuilt for a new rule just as for a new value.
-const int RULE_VERSION = 1;
+// Goes up whenever wants_bias() picks different samplers or the bias is worked
+// out differently, so the cache is rebuilt for a new rule just as for a new
+// value.
+const int RULE_VERSION = 2;
 
 // Gameplay long enough for the game to have built and saved its pipelines.
 const auto REBUILD_TIME = std::chrono::minutes(3);
@@ -75,30 +83,21 @@ std::filesystem::path game_documents()
     return path;
 }
 
-// The fraction of the screen width the game renders at, from its own
-// settings, as it will start with.
-float saved_render_scale(const std::filesystem::path &folder)
+// How much smaller FSR renders inside the resolution scale's size, from the
+// game's settings file: 1 with FSR off. FSRQuality 1 was seen rendering half
+// the size, Performance, and 4 rendering 744 of 960, Ultra Quality; 3 and 2
+// follow FSR 1's order between them.
+float saved_fsr_ratio(const std::filesystem::path &folder)
 {
-    wchar_t value[32] = L"";
-    GetPrivateProfileStringW(L"Graphics", L"PixelDensity", L"1", value, DWORD(std::size(value)),
-                             (folder / L"ACValhalla.ini").c_str());
-    float scale = std::wcstof(value, nullptr);
-    if (scale < 0.25f || scale > 4.0f)
-        scale = 1.0f;
-
-    // With FSR on, FSR 1 renders smaller again inside that size, by its own
-    // ratios. 4 was seen rendering 744 of 960, Ultra Quality; the rest follow
-    // FSR 1's order down to Performance.
     const std::wstring ini = (folder / L"ACValhalla.ini").wstring();
-    if (GetPrivateProfileIntW(L"Graphics", L"UpsampleType", 0, ini.c_str()) == 1)
-    {
-        static const float FSR_RATIO[] = {1.0f, 1.0f / 2.0f, 1.0f / 1.7f, 1.0f / 1.5f, 1.0f / 1.3f};
-        const UINT quality = GetPrivateProfileIntW(L"Graphics", L"FSRQuality", 0, ini.c_str());
-        if (quality < std::size(FSR_RATIO))
-            scale *= FSR_RATIO[quality];
-    }
-    return scale;
+    if (GetPrivateProfileIntW(L"Graphics", L"UpsampleType", 0, ini.c_str()) != 1)
+        return 1.0f;
+    static const float FSR_RATIO[] = {1.0f, 1.0f / 2.0f, 1.0f / 1.7f, 1.0f / 1.5f, 1.0f / 1.3f};
+    const UINT quality = GetPrivateProfileIntW(L"Graphics", L"FSRQuality", 0, ini.c_str());
+    return quality < std::size(FSR_RATIO) ? FSR_RATIO[quality] : 1.0f;
 }
+
+std::filesystem::path g_folder;
 
 std::string read_file(const std::filesystem::path &path)
 {
@@ -142,7 +141,19 @@ void match_pipeline_cache(const std::filesystem::path &folder)
 
     const std::string note = read_file(g_note);
     if (note == g_finished)
+    {
+        acv_log(reshade::log::level::info, "pipeline cache matches the LOD bias, kept");
         return;
+    }
+    // Without a bias, a cache this add-on never touched is the game's own and
+    // already right.
+    if (note.empty() && g_bias == 0.0f)
+    {
+        std::error_code error;
+        std::filesystem::create_directories(cache, error);
+        write_note(g_finished);
+        return;
+    }
 
     const char *why = "the LOD bias changed";
     if (note.empty())
@@ -155,21 +166,21 @@ void match_pipeline_cache(const std::filesystem::path &folder)
         std::filesystem::remove_all(cache, error);
         if (error)
         {
-            reshade::log::message(reshade::log::level::warning,
-                                  "ACV DLSS: could not clear the game's pipeline cache; the LOD bias stays off");
+            acv_log(reshade::log::level::warning,
+                    "could not clear the game's pipeline cache, so the LOD bias stays off this session");
             g_bias = 0.0f;
             return;
         }
         const std::string text =
-            std::string("ACV DLSS: cleared the game's pipeline cache because ") + why + "; this start will be slow";
-        reshade::log::message(reshade::log::level::info, text.c_str());
+            std::string("cleared the game's pipeline cache because ") + why + ". This start will be slow.";
+        acv_log(reshade::log::level::info, text.c_str());
     }
     std::filesystem::create_directories(cache, error);
     g_building = write_note("building, " + g_finished);
     if (!g_building)
     {
-        reshade::log::message(reshade::log::level::warning,
-                              "ACV DLSS: could not write to the game's pipeline cache; the LOD bias stays off");
+        acv_log(reshade::log::level::warning,
+                "could not write to the game's pipeline cache, so the LOD bias stays off this session");
         g_bias = 0.0f;
     }
 }
@@ -224,7 +235,15 @@ void lod_register()
         return;
     // Applied whether DLSS starts on or off, so switching it does not cost a
     // cache rebuild.
-    g_bias = lod_bias_for(saved_render_scale(folder));
+    g_folder = folder;
+    const float ratio = saved_fsr_ratio(folder);
+    g_bias = lod_bias_for(ratio);
+    char text[96];
+    if (ratio < 1.0f)
+        snprintf(text, sizeof(text), "LOD bias %+.2f for FSR rendering at %.0f%%", g_bias, ratio * 100.0f);
+    else
+        snprintf(text, sizeof(text), "LOD bias 0, FSR is off");
+    acv_log(reshade::log::level::info, text);
     match_pipeline_cache(folder);
     reshade::register_event<reshade::addon_event::create_sampler>(on_create_sampler);
 }
@@ -244,17 +263,20 @@ void lod_frame(bool gameplay)
         return;
     g_building = false;
     if (write_note(g_finished))
-        reshade::log::message(reshade::log::level::info, "ACV DLSS: the game's pipeline cache is rebuilt");
+        acv_log(reshade::log::level::info, "pipeline cache rebuilt");
     else
-        reshade::log::message(reshade::log::level::warning,
-                              "ACV DLSS: could not mark the pipeline cache as rebuilt; the next start clears it again");
+        acv_log(reshade::log::level::warning,
+                "could not mark the pipeline cache as rebuilt, so the next start clears it again");
 }
 
-// NVIDIA's DLSS programming guide: log2(render width / output width) - 1.
-// At 100% and above DLSS outputs at the render size, so the ratio is 1.
-float lod_bias_for(float resolution_scale)
+float lod_bias_for(float fsr_ratio)
 {
-    return std::log2(std::min(resolution_scale, 1.0f)) - 1.0f;
+    return std::log2(std::min(fsr_ratio, 1.0f));
+}
+
+float lod_bias_saved()
+{
+    return g_folder.empty() ? g_bias : lod_bias_for(saved_fsr_ratio(g_folder));
 }
 
 float lod_bias()

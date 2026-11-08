@@ -28,8 +28,7 @@ struct dlss_frame
 class dlss
 {
 public:
-    // With log on, NGX's own messages and every feature it builds go to
-    // ReShade's log.
+    // With log on, NGX's own messages go to our log too.
     bool init(ID3D12Device *device, bool log);
     void shutdown();
 
@@ -57,6 +56,5 @@ private:
     NVSDK_NGX_Handle *_feature = nullptr;
     uint32_t _width = 0, _height = 0, _output_width = 0, _output_height = 0, _preset = 0;
     bool _hdr = false;
-    bool _log = false;
     std::string _error;
 };

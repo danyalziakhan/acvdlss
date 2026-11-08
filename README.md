@@ -31,20 +31,31 @@ The game's **Resolution Scale** setting decides what DLSS does:
 - **Above 100%** DLSS runs as DLAA at the larger size and the game scales it
   down as usual.
 - **FSR** as the game's upscaler works too. DLSS takes FSR 1's place and FSR
-  1's sharpening is skipped. See below for why it's better left off.
+  1's sharpening is skipped. With the resolution scale at 100%, this is the
+  best way to render below your screen's resolution, because textures keep
+  their full detail (see below).
 
-Textures get the negative mip LOD bias NVIDIA recommends, which is
-log2(render / output) - 1. That is -1 at 100% and above and about -1.5 at
-70%. Only tiling material textures get it, never screen effects such as
-exposure.
+## Texture detail
 
-DLSS picks up a new resolution scale straight away. The LOD bias needs a full
-game restart because the game builds it into its pipelines at start up. Until
-then the window shows the new bias in amber. The first start with the add-on
-and the first start after a change take longer than usual while the game
-rebuilds its pipeline cache. Play for 3 minutes with DLSS on after such a
-start. If you quit sooner, the next start rebuilds the cache again, so a
-half-built cache is never kept.
+The game loads texture detail for the resolution scale's size. FSR renders
+smaller than that, so with FSR on the textures get a negative mip LOD bias to
+make up the difference: -1 at Performance, about -0.38 at Ultra Quality. With
+FSR off there's no bias, since the game already renders at the size it loads
+detail for. Only tiling material textures get it, never screen effects.
+
+NVIDIA's guidelines add another -1 on top. In this game that asks for detail
+it never loads, and the ground turns black up close where leaves and debris
+lie, so it isn't used.
+
+DLSS picks up a new resolution scale or FSR mode straight away, but the LOD
+bias needs a restart, because the game builds it into its pipelines at start
+up. The first start after the bias changes is slow while the game rebuilds its
+pipeline cache. Play for 3 minutes with DLSS on after it, or the next start
+rebuilds the cache again.
+
+![The window after switching FSR to Performance, with the new bias waiting for a restart](nexus/1-window-lod-restart.png)
+
+![The window after the restart, with the LOD bias at -1.00](nexus/1-window-lod-bias.png)
 
 ## Installing
 
@@ -58,9 +69,9 @@ half-built cache is never kept.
 ## Settings
 
 Open the ReShade overlay to find the **ACV DLSS** window. The top of it shows
-what DLSS is doing right now and the current LOD bias.
+what DLSS is doing right now, and the LOD bias when FSR is on.
 
-![The ACV DLSS window, running DLAA at 1920x1200](screenshots/window.png)
+![The ACV DLSS window, running DLAA at 1920x1200](nexus/1-window.png)
 
 - **Enabled** switches between DLSS and the game's own TAA.
 - **Toggle key** does the same while playing. It's F10 by default but you can
@@ -74,7 +85,7 @@ what DLSS is doing right now and the current LOD bias.
   removed A to D from current DLSS and reserves G, H and I, so those act as
   Auto.
 
-  ![The preset list open](screenshots/presets.png)
+  ![The preset list open](nexus/2-presets.png)
 
 - **Sharpness** applies AMD's RCAS to the DLSS image before the HUD is drawn.
 
@@ -85,20 +96,42 @@ Settings are saved to `ReShade.ini` under `[ACVDLSS]`.
 - Menus and loading screens show the game's own image because the game draws
   them without TAA.
 - Dialogue cutscenes work with DLSS too, including the letterboxed ones.
-- ShortFuse's RenoDX DLSS works well with it. Its **Render** and **Upscaled**
-  hook methods apply DLSS 5 neural rendering inside the DLSS pass with the
-  game's motion vectors, which gives more stable results than applying it to
-  the final image.
 - Don't combine it with any other mod that replaces the game's anti-aliasing.
+  RenoDX DLSS is the exception, see below.
+- ACV DLSS writes `acvdlss.log` next to `ACValhalla.exe`, started fresh each
+  time the game starts. Attach it when you report a problem. Its warnings also
+  appear in ReShade's log.
 
-## Why FSR is better left off
+## With RenoDX DLSS
+
+ShortFuse's RenoDX DLSS works alongside it. Its **Render** and **Upscaled**
+hook methods apply DLSS 5 neural rendering inside the DLSS pass with the game's
+motion vectors, which gives more stable results than applying it to the final
+image.
+
+1. Install ACV DLSS as above.
+2. Put `renodx-dlss.addon64` and `nvngx_dlssnr.dll` next to `ACValhalla.exe` as
+   well.
+3. Preferably, use `nvngx_dlss.dll` and `nvngx_dlssnr.dll` from the same DLSS
+   release. Different versions should still work, but if the game crashes as
+   DLSS-NR starts, try matching them first.
+
+Tested together: RenoDX DLSS 0.2026.1025.409, both NVIDIA DLLs at 310.9.16,
+ReShade 6.8.0.
+
+Running Lecram's DLSS 5 Neural Rendering (`renodx-dlss5.addon64`) alongside
+RenoDX DLSS isn't recommended. If you do, set its **Hook point** to
+**Present**. Its other hook points run inside the DLSS pass, and with RenoDX
+DLSS also there the game crashes as neural rendering starts.
+
+## Don't stack FSR on a lower resolution scale
 
 The game's FSR stacks on top of the resolution scale, so 70% with FSR
 Performance renders at only 35% of your screen. The game's camera cycles
-through just 8 sub-pixel positions, which is enough for DLSS at 70% and above
+through just 8 sub-pixel positions, which is enough for DLSS down to about 50%
 but not at very low render sizes, where foliage and shadows shimmer until DLSS
-settles. Turn FSR off and use the resolution scale to set the render size
-instead.
+settles. To render below your screen's resolution, keep the resolution scale
+at 100% and pick an FSR mode.
 
 ## Building
 

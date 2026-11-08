@@ -32,6 +32,7 @@ add_library(acvdlss SHARED
     src/dlss.cpp
     src/passes.cpp
     src/lod.cpp
+    src/log.cpp
     src/acvdlss.rc
     deps/reshade/examples/utils/descriptor_tracking.cpp
     ${SHADER_HEADERS})
@@ -41,7 +42,7 @@ target_include_directories(acvdlss PRIVATE
     deps/imgui
     deps/dlss/include
     ${CMAKE_CURRENT_BINARY_DIR}/shaders)
-target_link_libraries(acvdlss PRIVATE d3d12 dxgi shell32 ole32
+target_link_libraries(acvdlss PRIVATE d3d12 dxgi shell32 ole32 version
     $<IF:$<CONFIG:Debug>,${NGX_LIB}/nvsdk_ngx_s_dbg.lib,${NGX_LIB}/nvsdk_ngx_s.lib>)
 target_compile_definitions(acvdlss PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
 target_compile_options(acvdlss PRIVATE /W3 /utf-8)
