@@ -2095,11 +2095,13 @@ void taa_unregister()
     reshade::unregister_event<reshade::addon_event::update_descriptor_tables>(on_update_tables_end);
 }
 
-void taa_present(command_queue *queue, uint32_t display_width, uint32_t display_height)
+// Returns whether DLSS replaced the TAA within the last IDLE_FRAMES, which is
+// gameplay rather than a menu, a loading screen or the map.
+static bool present_frame(command_queue *queue, uint32_t display_width, uint32_t display_height)
 {
     std::lock_guard ctx_lock(g_ctx_lock);
     if (g_ctx == nullptr)
-        return;
+        return false;
     context &c = *g_ctx;
     std::lock_guard lock(c.lock);
     c.queue = queue;
@@ -2114,7 +2116,7 @@ void taa_present(command_queue *queue, uint32_t display_width, uint32_t display_
     if (g_settings.debug)
         debug_frame(c);
     if (!c.ready || c.failed)
-        return;
+        return false;
     const taa_state before = c.status.state;
     if (!g_settings.enabled)
         set_status(c, taa_state::off);
@@ -2123,6 +2125,13 @@ void taa_present(command_queue *queue, uint32_t display_width, uint32_t display_
     if (before == taa_state::running && c.status.state == taa_state::waiting)
         debug_event("no TAA pass for %llu frames (a menu, a loading screen or the map)",
                     static_cast<unsigned long long>(IDLE_FRAMES));
+    return c.status.state == taa_state::running;
+}
+
+void taa_present(command_queue *queue, uint32_t display_width, uint32_t display_height)
+{
+    // Outside the lock: it writes a file once.
+    lod_frame(present_frame(queue, display_width, display_height));
 }
 
 void taa_restart()

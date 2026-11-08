@@ -54,9 +54,9 @@ taa_status taa_get_status();
 // before the game has a device to build pipelines with. It may clear the
 // pipeline cache.
 void lod_register();
-// Called as the add-on unloads: marks a rebuilt pipeline cache as finished if
-// the session ran long enough to have built it.
-void lod_session_end();
+// Once a frame: marks a pipeline cache this session cleared as rebuilt after
+// enough gameplay, which is frames where DLSS replaced the TAA.
+void lod_frame(bool gameplay);
 float lod_bias_for(float resolution_scale);
 float lod_bias();             // 0 when none was applied
 uint32_t lod_biased_samplers();

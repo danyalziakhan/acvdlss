@@ -42,8 +42,9 @@ DLSS picks up a new resolution scale straight away. The LOD bias needs a full
 game restart because the game builds it into its pipelines at start up. Until
 then the window shows the new bias in amber. The first start with the add-on
 and the first start after a change take longer than usual while the game
-rebuilds its pipeline cache. Let it finish, because closing the game during
-the rebuild can leave a broken cache behind.
+rebuilds its pipeline cache. Play for 3 minutes with DLSS on after such a
+start. If you quit sooner, the next start rebuilds the cache again, so a
+half-built cache is never kept.
 
 ## Installing
 

@@ -445,7 +445,6 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_overlay("ACV DLSS", draw_window);
         break;
     case DLL_PROCESS_DETACH:
-        lod_session_end();
         taa_unregister();
         reshade::unregister_addon(module);
         break;

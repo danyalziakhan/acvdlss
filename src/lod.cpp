@@ -14,8 +14,10 @@
 //
 // A rebuild cut short leaves a cache that is just as broken: shadows that
 // blink and blotch, a banded sky. So the note in the cache says "building"
-// until a session that rebuilt it ends normally after REBUILD_TIME, and a
-// start that still finds "building" clears it again.
+// until the session that cleared it has run REBUILD_TIME of gameplay with DLSS
+// on, and a start that still finds "building" clears it again. The note is
+// finished while the game runs: the game ends its process without unloading
+// the add-on, so nothing written at exit can be relied on.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -48,8 +50,11 @@ namespace
 // rebuilt for a new rule just as for a new value.
 const int RULE_VERSION = 1;
 
-// Long enough for the game to have built its pipelines and reached gameplay.
+// Gameplay long enough for the game to have built and saved its pipelines.
 const auto REBUILD_TIME = std::chrono::minutes(3);
+// A longer gap between frames is a pause, a loading stall or the game in the
+// background, and does not count as gameplay.
+const auto MAX_FRAME_TIME = std::chrono::milliseconds(250);
 
 float g_bias = 0.0f;
 std::atomic<uint32_t> g_biased{0};
@@ -57,7 +62,8 @@ std::atomic<uint32_t> g_biased{0};
 std::filesystem::path g_note; // inside the cache, so it goes when the cache does
 std::string g_finished;       // what the note says once the rebuild is done
 bool g_building = false;      // this session cleared the cache
-std::chrono::steady_clock::time_point g_started;
+std::chrono::steady_clock::duration g_gameplay{};
+std::chrono::steady_clock::time_point g_last_frame;
 
 std::filesystem::path game_documents()
 {
@@ -102,6 +108,27 @@ std::string read_file(const std::filesystem::path &path)
     return text;
 }
 
+// Writes the note to a file beside it and moves that over it, so the game
+// ending mid-write leaves the old note rather than half a new one.
+bool write_note(const std::string &line)
+{
+    std::filesystem::path temp = g_note;
+    temp += L".new";
+    const HANDLE file =
+        CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        return false;
+    const std::string text = line + "\n";
+    DWORD written = 0;
+    const bool wrote = WriteFile(file, text.data(), DWORD(text.size()), &written, nullptr) &&
+                       written == text.size() && FlushFileBuffers(file);
+    CloseHandle(file);
+    if (wrote && MoveFileExW(temp.c_str(), g_note.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        return true;
+    DeleteFileW(temp.c_str());
+    return false;
+}
+
 // Clears the game's pipeline cache unless it was fully built with the bias
 // about to be applied. Runs while the add-on loads, before the game has a
 // device to build pipelines with.
@@ -117,9 +144,11 @@ void match_pipeline_cache(const std::filesystem::path &folder)
     if (note == g_finished)
         return;
 
-    const char *why = note.empty()                      ? "it has no note from this add-on"
-                      : note == "building, " + g_finished ? "its last rebuild did not finish"
-                                                          : "the LOD bias changed";
+    const char *why = "the LOD bias changed";
+    if (note.empty())
+        why = "it has no note from this add-on";
+    else if (note == "building, " + g_finished)
+        why = "its last rebuild did not finish (that takes 3 minutes of play with DLSS on)";
     std::error_code error;
     if (std::filesystem::exists(cache, error))
     {
@@ -136,8 +165,13 @@ void match_pipeline_cache(const std::filesystem::path &folder)
         reshade::log::message(reshade::log::level::info, text.c_str());
     }
     std::filesystem::create_directories(cache, error);
-    std::ofstream(g_note) << "building, " << g_finished << '\n';
-    g_building = true;
+    g_building = write_note("building, " + g_finished);
+    if (!g_building)
+    {
+        reshade::log::message(reshade::log::level::warning,
+                              "ACV DLSS: could not write to the game's pipeline cache; the LOD bias stays off");
+        g_bias = 0.0f;
+    }
 }
 
 // Material textures only: they tile, so their samplers wrap, and they are
@@ -185,7 +219,6 @@ bool on_create_sampler(device *dev, sampler_desc &desc)
 
 void lod_register()
 {
-    g_started = std::chrono::steady_clock::now();
     const std::filesystem::path folder = game_documents();
     if (folder.empty())
         return;
@@ -196,21 +229,25 @@ void lod_register()
     reshade::register_event<reshade::addon_event::create_sampler>(on_create_sampler);
 }
 
-// Called as the add-on unloads, which a crash or a killed process skips. The
-// C++ runtime may already be going away, so the note is written with Win32.
-void lod_session_end()
+// Once a frame, on the present thread.
+void lod_frame(bool gameplay)
 {
-    if (!g_building || std::chrono::steady_clock::now() - g_started < REBUILD_TIME)
+    if (!g_building)
         return;
-    const HANDLE file =
-        CreateFileW(g_note.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE)
+    const auto now = std::chrono::steady_clock::now();
+    const auto step = now - g_last_frame;
+    g_last_frame = now;
+    if (!gameplay || step > MAX_FRAME_TIME)
         return;
-    const std::string text = g_finished + "\n";
-    DWORD written = 0;
-    WriteFile(file, text.data(), DWORD(text.size()), &written, nullptr);
-    CloseHandle(file);
+    g_gameplay += step;
+    if (g_gameplay < REBUILD_TIME)
+        return;
     g_building = false;
+    if (write_note(g_finished))
+        reshade::log::message(reshade::log::level::info, "ACV DLSS: the game's pipeline cache is rebuilt");
+    else
+        reshade::log::message(reshade::log::level::warning,
+                              "ACV DLSS: could not mark the pipeline cache as rebuilt; the next start clears it again");
 }
 
 // NVIDIA's DLSS programming guide: log2(render width / output width) - 1.
