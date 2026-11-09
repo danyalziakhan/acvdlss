@@ -10,7 +10,7 @@ cbuffer constants : register(b0)
     float4 inv_proj[4];
     float4 cam_to_world[3];
     float4 prev_view_proj[3]; // rows x, y and w
-    float4 jitter_delta;   // xy: previous minus current jitter in UV, z: 1 when the game wrote motion vectors
+    float4 flags;          // x: 1 when the game wrote motion vectors
 };
 
 Texture2D<float4> game_color : register(t0);
@@ -62,12 +62,14 @@ void main(uint3 id : SV_DispatchThreadID)
     float2 uv = (float2(p) + 0.5) * size.zw;
     bool sky = d >= depth_params.x;
 
-    // Dialogue cutscenes bind a 4x4 placeholder instead of motion vectors, so
-    // every pixel there gets the camera's motion.
+    // The sky, and every pixel of a dialogue cutscene (where the game binds a
+    // 4x4 placeholder instead of motion vectors), get the camera's motion. No
+    // jitter term: tested live with +1, 0, -1 and +2 times the change in
+    // jitter, only 0 keeps the clouds still.
     float2 motion;
-    if (sky || jitter_delta.z == 0.0)
+    if (sky || flags.x == 0.0)
     {
-        motion = reproject(uv, d, sky) - uv - jitter_delta.xy;
+        motion = reproject(uv, d, sky) - uv;
     }
     else
     {

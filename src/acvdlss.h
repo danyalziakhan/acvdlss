@@ -69,16 +69,14 @@ void taa_present(reshade::api::command_queue *queue, uint32_t display_width, uin
 // own TAA ran in between.
 void taa_restart();
 taa_status taa_get_status();
-// Set once DLSS has started: why nvngx_dlss.dll and nvngx_dlssnr.dll may not
-// work together, or empty.
-std::string dlss_versions_warning();
 // Texture LOD bias, set on the game's samplers as they are created.
 // Called as the add-on loads, which ReShade does inside D3D12CreateDevice,
 // before the game has a device to build pipelines with. It may clear the
 // pipeline cache.
 void lod_register();
 // Once a frame: marks a pipeline cache this session cleared as rebuilt after
-// enough gameplay, which is frames where DLSS replaced the TAA.
+// enough play, which is frames where DLSS replaced the TAA, or any steady
+// frames while it is off or cannot run.
 void lod_frame(bool gameplay);
 // The bias for how much smaller FSR renders inside the resolution scale's
 // size, 1 with FSR off.

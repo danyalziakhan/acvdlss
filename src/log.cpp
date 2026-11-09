@@ -15,6 +15,7 @@
 
 #include <reshade.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cwchar>
@@ -73,6 +74,66 @@ static std::string module_path(HMODULE module)
 
 static LONG CALLBACK on_exception(EXCEPTION_POINTERS *info);
 
+// The quoted value after a key in one of Steam's .acf files, or empty.
+static std::string acf_value(const std::string &text, const char *key)
+{
+    const std::string quoted = std::string("\"") + key + "\"";
+    size_t at = text.find(quoted);
+    if (at == std::string::npos)
+        return {};
+    at = text.find('"', at + quoted.size());
+    const size_t end = at == std::string::npos ? at : text.find('"', at + 1);
+    return end == std::string::npos ? std::string() : text.substr(at + 1, end - at - 1);
+}
+
+// The game's exe carries no version. A Steam copy has its build number in the
+// app manifest beside the library's common folder; any other copy, Ubisoft
+// Connect's included, gets the exe's date instead. Only files are read.
+static std::string game_build()
+{
+    wchar_t exe[MAX_PATH] = L"";
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    const std::wstring path(exe);
+    const size_t folder_end = path.find_last_of(L'\\');
+    const size_t common_end = folder_end == std::wstring::npos ? folder_end : path.find_last_of(L'\\', folder_end - 1);
+    if (common_end != std::wstring::npos)
+    {
+        const std::wstring folder = path.substr(common_end + 1, folder_end - common_end - 1);
+        const std::wstring steamapps = path.substr(0, common_end) + L"\\..";
+        WIN32_FIND_DATAW found;
+        const HANDLE search = FindFirstFileW((steamapps + L"\\appmanifest_*.acf").c_str(), &found);
+        if (search != INVALID_HANDLE_VALUE)
+        {
+            std::string build;
+            do
+            {
+                FILE *file = _wfopen((steamapps + L"\\" + found.cFileName).c_str(), L"rb");
+                if (file == nullptr)
+                    continue;
+                std::string text(size_t(std::min<DWORD>(found.nFileSizeLow, 1 << 16)), '\0');
+                text.resize(fread(text.data(), 1, text.size(), file));
+                fclose(file);
+                const std::string dir = acf_value(text, "installdir");
+                const int n = MultiByteToWideChar(CP_UTF8, 0, dir.c_str(), int(dir.size()), nullptr, 0);
+                std::wstring wide(size_t(n), L'\0');
+                MultiByteToWideChar(CP_UTF8, 0, dir.c_str(), int(dir.size()), wide.data(), n);
+                if (!wide.empty() && _wcsicmp(wide.c_str(), folder.c_str()) == 0)
+                    build = acf_value(text, "buildid");
+            } while (build.empty() && FindNextFileW(search, &found));
+            FindClose(search);
+            if (!build.empty())
+                return "Steam build " + build;
+        }
+    }
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    SYSTEMTIME date;
+    if (!GetFileAttributesExW(exe, GetFileExInfoStandard, &data) || !FileTimeToSystemTime(&data.ftLastWriteTime, &date))
+        return "unknown";
+    char text[48];
+    snprintf(text, sizeof(text), "exe dated %04u-%02u-%02u", date.wYear, date.wMonth, date.wDay);
+    return text;
+}
+
 // What a report needs before anything else: which build, which game, which
 // ReShade, and the game's own settings that change what the add-on does.
 void log_start()
@@ -87,7 +148,7 @@ void log_start()
         return text.empty() ? std::string("unknown") : text;
     };
     std::string text = "ACV DLSS " + version(self) + ", ReShade " +
-                       version(reshade::internal::get_reshade_module_handle()) + ", game " + version(nullptr) + " at " +
+                       version(reshade::internal::get_reshade_module_handle()) + ", game " + game_build() + " at " +
                        module_path(nullptr);
     acv_log(reshade::log::level::info, text.c_str());
     AddVectoredExceptionHandler(0, on_exception);

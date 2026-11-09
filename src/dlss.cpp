@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include "acvdlss.h"
+#include "ngx_guard.h"
 #include "dlss.h"
 
 #include <nvsdk_ngx.h>
@@ -10,40 +11,57 @@
 
 #include <reshade.hpp>
 
+#include <softpub.h>
+#include <wintrust.h>
+
+#include <cfloat>
+#include <cstring>
 #include <cstdio>
-#include <mutex>
+#include <cwchar>
+#include <optional>
 #include <string>
 
 // Any stable GUID works as a project ID for NGX; this one is ours.
 static const char *PROJECT_ID = "5c3f9a1e-7b2d-4e8a-9f61-0d4c2b7e3a95";
 
-static std::mutex g_versions_lock;
-static std::string g_versions_warning;
-
-// RenoDX DLSS runs DLSS-NR from nvngx_dlssnr.dll on the same NVIDIA runtime as
-// our DLSS. Both from 310.9.16 work together; a user with nvngx_dlss.dll
-// 310.9.1 had the game crash as DLSS-NR started. So the versions go in the log,
-// and the window says when they differ.
-static void check_versions(const std::wstring &folder)
+// Whether a file carries a valid signature, so a report tells an official
+// nvngx_dlssnr.dll from a modified one: NGX only loads signed ones. Cached
+// certificate data only, so start-up never waits on the network.
+static const char *signature_of(const std::wstring &path)
 {
-    const std::string dlss = file_version(folder + L"\\nvngx_dlss.dll");
-    const std::string nr = file_version(folder + L"\\nvngx_dlssnr.dll");
-    std::string text = "nvngx_dlss.dll " + (dlss.empty() ? std::string("not found") : dlss);
-    if (!nr.empty())
-        text += ", nvngx_dlssnr.dll " + nr;
-    acv_log(reshade::log::level::info, text.c_str());
-    if (dlss.empty() || nr.empty() || dlss == nr)
-        return;
-    std::lock_guard lock(g_versions_lock);
-    g_versions_warning = "nvngx_dlss.dll is " + dlss + " and nvngx_dlssnr.dll is " + nr +
-                         ". If DLSS-NR crashes the game, use both from the same DLSS release.";
-    acv_log(reshade::log::level::warning, g_versions_warning.c_str());
+    WINTRUST_FILE_INFO file = {sizeof(file)};
+    file.pcwszFilePath = path.c_str();
+    WINTRUST_DATA data = {sizeof(data)};
+    data.dwUIChoice = WTD_UI_NONE;
+    data.fdwRevocationChecks = WTD_REVOKE_NONE;
+    data.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
+    data.dwUnionChoice = WTD_CHOICE_FILE;
+    data.pFile = &file;
+    data.dwStateAction = WTD_STATEACTION_VERIFY;
+    GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    const LONG result = WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action, &data);
+    data.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action, &data);
+    return result == ERROR_SUCCESS ? "signed" : result == LONG(TRUST_E_NOSIGNATURE) ? "unsigned" : "signature invalid";
 }
 
-std::string dlss_versions_warning()
+// The DLSS DLLs beside the game, for reports: RenoDX DLSS runs DLSS 5 (neural
+// rendering) from nvngx_dlssnr.dll on the same NVIDIA runtime as our DLSS.
+static void log_versions(const std::wstring &folder)
 {
-    std::lock_guard lock(g_versions_lock);
-    return g_versions_warning;
+    std::string text;
+    for (const wchar_t *name : {L"nvngx_dlss.dll", L"nvngx_dlssnr.dll"})
+    {
+        const std::wstring path = folder + L"\\" + name;
+        const std::string version = file_version(path);
+        if (version.empty() && wcscmp(name, L"nvngx_dlssnr.dll") == 0)
+            continue;
+        char part[96];
+        snprintf(part, sizeof(part), "%s%ls %s", text.empty() ? "" : ", ", name,
+                 version.empty() ? "not found" : (version + " " + signature_of(path)).c_str());
+        text += part;
+    }
+    acv_log(reshade::log::level::info, text.c_str());
 }
 
 static std::string describe(const char *what, NVSDK_NGX_Result result)
@@ -86,7 +104,7 @@ bool dlss::init(ID3D12Device *device, bool log)
 {
     _device = device;
     const std::wstring folder = game_folder();
-    check_versions(folder);
+    log_versions(folder);
     // NGX looks next to the exe on its own; naming the folder also covers
     // launchers that start the game from somewhere else.
     const wchar_t *paths[] = {folder.c_str()};
@@ -109,6 +127,9 @@ bool dlss::init(ID3D12Device *device, bool log)
     // gets a folder of its own.
     const std::wstring data = folder + L"\\acvdlss";
     CreateDirectoryW(data.c_str(), nullptr);
+    // DLSS 5 stays out of our start-up (see ngx_guard.h); NGX may load its
+    // features both while starting and while reporting what it supports.
+    std::optional<ngx_guard> guard(std::in_place, folder);
     NVSDK_NGX_Result result = NVSDK_NGX_D3D12_Init_with_ProjectID(
         PROJECT_ID, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0", data.c_str(), device, &info);
     if (NVSDK_NGX_FAILED(result))
@@ -120,6 +141,7 @@ bool dlss::init(ID3D12Device *device, bool log)
     }
 
     result = NVSDK_NGX_D3D12_GetCapabilityParameters(&_params);
+    guard.reset();
     if (NVSDK_NGX_FAILED(result))
     {
         _params = nullptr;
@@ -198,10 +220,13 @@ bool dlss::create(ID3D12GraphicsCommandList *list, const dlss_frame &frame)
     create.Feature.InTargetHeight = frame.output_height;
     create.Feature.InPerfQualityValue = quality_for(frame);
     // The game's depth is reversed and its motion vectors carry no jitter.
-    // An HDR frame has no exposure value we could hand over, so DLSS measures it.
-    create.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
+    // The game hands over no exposure value, so DLSS measures it, for SDR
+    // frames too: players of other games report less ghosting with it.
+    create.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
+                                  NVSDK_NGX_DLSS_Feature_Flags_DepthInverted |
+                                  NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
     if (frame.hdr)
-        create.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+        create.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
 
     const NVSDK_NGX_Result result = NGX_D3D12_CREATE_DLSS_EXT(list, 1, 1, &_feature, _params, &create);
     if (NVSDK_NGX_FAILED(result))
@@ -222,6 +247,14 @@ bool dlss::create(ID3D12GraphicsCommandList *list, const dlss_frame &frame)
     snprintf(text, sizeof(text), "DLSS created: %ux%u to %ux%u, %s mode, preset %s%s", frame.width, frame.height,
              frame.output_width, frame.output_height, quality_name(create.Feature.InPerfQualityValue),
              preset_name(frame.preset).c_str(), frame.hdr ? ", HDR" : "");
+    acv_log(reshade::log::level::info, text);
+    const float degrees = frame.camera_fov * 180.0f / 3.14159265f;
+    if (frame.camera_far >= FLT_MAX)
+        snprintf(text, sizeof(text), "camera: near %.2f, far infinite, vertical field of view %.1f degrees",
+                 frame.camera_near, degrees);
+    else
+        snprintf(text, sizeof(text), "camera: near %.2f, far %.0f, vertical field of view %.1f degrees",
+                 frame.camera_near, frame.camera_far, degrees);
     acv_log(reshade::log::level::info, text);
     return true;
 }
@@ -249,6 +282,11 @@ bool dlss::evaluate(ID3D12GraphicsCommandList *list, const dlss_frame &frame)
     eval.InMVScaleX = float(frame.width);
     eval.InMVScaleY = float(frame.height);
     eval.InFrameTimeDeltaInMsec = frame.frame_ms;
+    // Not used by DLSS. Tools that take DLSS's inputs for frame generation
+    // read the camera under these names when a game provides them.
+    NVSDK_NGX_Parameter_SetF(_params, "FSR.cameraNear", frame.camera_near);
+    NVSDK_NGX_Parameter_SetF(_params, "FSR.cameraFar", frame.camera_far);
+    NVSDK_NGX_Parameter_SetF(_params, "FSR.cameraFovAngleVertical", frame.camera_fov);
 
     const NVSDK_NGX_Result result = NGX_D3D12_EVALUATE_DLSS_EXT(list, _feature, _params, &eval);
     if (NVSDK_NGX_FAILED(result))

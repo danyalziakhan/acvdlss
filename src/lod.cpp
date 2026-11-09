@@ -21,10 +21,18 @@
 //
 // A rebuild cut short leaves a cache that is just as broken: shadows that
 // blink and blotch, a banded sky. So the note in the cache says "building"
-// until the session that cleared it has run REBUILD_TIME of gameplay with DLSS
-// on, and a start that still finds "building" clears it again. The note is
+// until the session that cleared it has run REBUILD_TIME of play (frames where
+// DLSS replaced the TAA, or any steady frames while DLSS is off or cannot
+// run), and a start that still finds "building" clears it again. The note is
 // finished while the game runs: the game ends its process without unloading
 // the add-on, so nothing written at exit can be relied on.
+//
+// Damage that happens later cannot be seen from here. The game writes most of
+// its cache as it exits, after the last moment the add-on is called (seen:
+// ReShade gone at .766, the cache written from .870 to .952), and damaged
+// files load fine and just render wrong. So a cache without our note is never
+// vouched for, and 0.4 rebuilds every install's cache once; beyond that, the
+// README tells players to delete the cache folder.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -55,8 +63,9 @@ namespace
 {
 // Goes up whenever wants_bias() picks different samplers or the bias is worked
 // out differently, so the cache is rebuilt for a new rule just as for a new
-// value.
-const int RULE_VERSION = 2;
+// value. 3: one rebuild for every install with 0.4, so caches damaged before
+// it (interiors without their indirect light) are replaced.
+const int RULE_VERSION = 3;
 
 // Gameplay long enough for the game to have built and saved its pipelines.
 const auto REBUILD_TIME = std::chrono::minutes(3);
@@ -142,24 +151,21 @@ void match_pipeline_cache(const std::filesystem::path &folder)
     const std::string note = read_file(g_note);
     if (note == g_finished)
     {
-        acv_log(reshade::log::level::info, "pipeline cache matches the LOD bias, kept");
-        return;
-    }
-    // Without a bias, a cache this add-on never touched is the game's own and
-    // already right.
-    if (note.empty() && g_bias == 0.0f)
-    {
-        std::error_code error;
-        std::filesystem::create_directories(cache, error);
-        write_note(g_finished);
+        acv_log(reshade::log::level::info, "pipeline cache matches this LOD bias, kept");
         return;
     }
 
+    // A cache without our note may be anything, a damaged one included, so it
+    // is rebuilt rather than vouched for.
+    char rule[16];
+    snprintf(rule, sizeof(rule), "rule %d,", RULE_VERSION);
     const char *why = "the LOD bias changed";
     if (note.empty())
         why = "it has no note from this add-on";
     else if (note == "building, " + g_finished)
-        why = "its last rebuild did not finish (that takes 3 minutes of play with DLSS on)";
+        why = "its last rebuild did not finish (that takes 3 minutes of play)";
+    else if (note.find(rule) == std::string::npos)
+        why = "this version of the add-on rebuilds it once";
     std::error_code error;
     if (std::filesystem::exists(cache, error))
     {

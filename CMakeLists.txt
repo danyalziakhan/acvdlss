@@ -29,21 +29,24 @@ set(NGX_LIB ${CMAKE_CURRENT_SOURCE_DIR}/deps/dlss/lib/Windows_x86_64/x64)
 add_library(acvdlss SHARED
     src/acvdlss.cpp
     src/taa.cpp
+    src/jitter.cpp
+    src/ngx_guard.cpp
     src/dlss.cpp
     src/passes.cpp
     src/lod.cpp
     src/log.cpp
+    src/descriptors.cpp
     src/acvdlss.rc
-    deps/reshade/examples/utils/descriptor_tracking.cpp
     ${SHADER_HEADERS})
 target_include_directories(acvdlss PRIVATE
     deps/reshade/include
-    deps/reshade/examples/utils
     deps/imgui
     deps/dlss/include
     ${CMAKE_CURRENT_BINARY_DIR}/shaders)
-target_link_libraries(acvdlss PRIVATE d3d12 dxgi shell32 ole32 version
+target_link_libraries(acvdlss PRIVATE d3d12 dxgi shell32 ole32 version wintrust
     $<IF:$<CONFIG:Debug>,${NGX_LIB}/nvsdk_ngx_s_dbg.lib,${NGX_LIB}/nvsdk_ngx_s.lib>)
 target_compile_definitions(acvdlss PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
 target_compile_options(acvdlss PRIVATE /W3 /utf-8)
 set_target_properties(acvdlss PROPERTIES SUFFIX ".addon64")
+# Link-time optimization across the add-on's own files.
+set_target_properties(acvdlss PROPERTIES INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)

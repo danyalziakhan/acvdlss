@@ -16,11 +16,12 @@
 #include <dxgi1_4.h>
 
 #include "acvdlss.h"
+#include "descriptors.h"
+#include "jitter.h"
 #include "dlss.h"
 #include "passes.h"
 
 #include <reshade.hpp>
-#include <descriptor_tracking.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -56,6 +57,7 @@ const uint32_t SKY_RANGE = 0x60;     // (a - b) / (c - d) is the sky's view dept
 
 const uint32_t VIEW_SIZE = 0x490;
 const uint32_t CAM_TO_WORLD = 0x60;     // three rows
+const uint32_t PROJ_11 = 0x1b4;         // y scale: 1 / tan(vertical field of view / 2)
 const uint32_t PROJ_22 = 0x1c8;         // with PROJ_23, turns view depth into device depth
 const uint32_t PROJ_23 = 0x1cc;
 const uint32_t PREV_VIEW_PROJ_X = 0x260;
@@ -72,6 +74,9 @@ const uint32_t MAX_SKIPPED_DRAWS = 3;
 const size_t MAX_TABLE_TEXTURES = 64;
 // Frames without a TAA pass before the panel says it is waiting.
 const uint64_t IDLE_FRAMES = 30;
+// Frames into a session without any TAA pass before the log says why that
+// could be, and before the pipeline cache rebuild stops waiting for DLSS.
+const uint64_t NOTE_FRAMES = 3600;
 
 struct texture_entry
 {
@@ -242,11 +247,40 @@ struct __declspec(uuid("3c8e1f52-6a4d-4b9e-8d27-91f0a6c4e7b3")) list_state
     }
 };
 
+// A command list's state is looked up on every bind and draw, thousands of
+// times a frame, and ReShade's lookup is a call and a search. A list is only
+// ever recorded on one thread at a time, so each thread keeps the one it is
+// recording. A list's state going away bumps the generation, which empties
+// every thread's cache at once; the game destroys lists rarely.
+std::atomic<uint64_t> g_list_generation{0};
+
+struct list_cache
+{
+    command_list *cmd = nullptr;
+    list_state *state = nullptr;
+    uint64_t generation = 0;
+};
+thread_local list_cache t_list;
+
+list_state *find_state(command_list *cmd)
+{
+    const uint64_t generation = g_list_generation.load(std::memory_order_acquire);
+    if (t_list.cmd == cmd && t_list.generation == generation)
+        return t_list.state;
+    list_state *s = cmd->get_private_data<list_state>();
+    if (s != nullptr)
+        t_list = {cmd, s, generation};
+    return s;
+}
+
 list_state &state_of(command_list *cmd)
 {
-    if (list_state *s = cmd->get_private_data<list_state>())
+    if (list_state *s = find_state(cmd))
         return *s;
-    return *cmd->create_private_data<list_state>();
+    const uint64_t generation = g_list_generation.load(std::memory_order_acquire);
+    list_state *s = cmd->create_private_data<list_state>();
+    t_list = {cmd, s, generation};
+    return *s;
 }
 
 struct context
@@ -266,8 +300,6 @@ struct context
     uint32_t display_width = 0, display_height = 0;
     bool failed = false;
     bool force_reset = true;
-    bool have_jitter = false;
-    float jitter[2] = {};
     std::chrono::steady_clock::time_point last_time;
     taa_status status;
 };
@@ -290,7 +322,7 @@ void debug_event(const char *format, ...)
 {
     if (!g_settings.debug)
         return;
-    char text[256];
+    char text[1024];
     va_list args;
     va_start(args, format);
     vsnprintf(text, sizeof(text), format, args);
@@ -379,7 +411,7 @@ private:
     uint64_t _start;
 };
 
-// descriptor_tracking's own handlers run between these two, which ReShade
+// The descriptor tracker's own handlers run between these two, which ReShade
 // calls in the order they were registered.
 thread_local uint64_t t_tracking_start = 0;
 
@@ -514,34 +546,14 @@ bool read_buffer(device *dev, const buffer_range &range, uint8_t *out, uint32_t 
     return true;
 }
 
-// descriptor_tracking throws for a heap it has not seen yet, and an exception
-// leaving an event callback takes the game down with it.
-resource_view view_at(const descriptor_tracking &tracking, descriptor_heap heap, uint32_t offset)
+resource_view view_at(const descriptor_tracker &tracking, descriptor_heap heap, uint32_t offset)
 {
-    if (heap.handle == 0)
-        return {0};
-    try
-    {
-        return tracking.get_resource_view(heap, offset);
-    }
-    catch (const std::out_of_range &)
-    {
-        return {0};
-    }
+    return tracking.view(heap, offset);
 }
 
-buffer_range buffer_at(const descriptor_tracking &tracking, descriptor_heap heap, uint32_t offset)
+buffer_range buffer_at(const descriptor_tracker &tracking, descriptor_heap heap, uint32_t offset)
 {
-    if (heap.handle == 0)
-        return {};
-    try
-    {
-        return tracking.get_buffer_range(heap, offset);
-    }
-    catch (const std::out_of_range &)
-    {
-        return {};
-    }
+    return tracking.buffer(heap, offset);
 }
 
 // The constant buffer behind a root parameter, whether it is bound as a root
@@ -561,7 +573,7 @@ const char *read_constants(device *dev, const root_state &root, uint32_t param, 
     descriptor_heap heap = {0};
     uint32_t offset = 0;
     dev->get_descriptor_heap_offset({v.value}, uint32_t(layout->first_cbv), 0, &heap, &offset);
-    const auto *tracking = dev->get_private_data<descriptor_tracking>();
+    const auto *tracking = descriptor_tracker::of(dev);
     if (tracking == nullptr)
         return "no descriptor tracking";
     const buffer_range range = buffer_at(*tracking, heap, offset);
@@ -570,8 +582,7 @@ const char *read_constants(device *dev, const root_state &root, uint32_t param, 
     return read_buffer(dev, range, out, size) ? nullptr : "CBV buffer could not be mapped";
 }
 
-// Everything prepare.hlsl needs except the jitter change, which depends on the
-// previous frame.
+// Everything prepare.hlsl needs except flags, which the caller sets.
 prepare_constants make_constants(const uint8_t *taa_cb, const uint8_t *view_cb, uint32_t width, uint32_t height)
 {
     prepare_constants k = {};
@@ -616,7 +627,7 @@ std::unordered_map<uint64_t, texture_info> g_textures;
 
 // Only the resource a table slot points at, or 0. The handle may belong to a
 // resource that is gone, so it is only ever compared, never used.
-uint64_t resource_at(device *dev, const descriptor_tracking &tracking, descriptor_table table, uint32_t binding)
+uint64_t resource_at(device *dev, const descriptor_tracker &tracking, descriptor_table table, uint32_t binding)
 {
     descriptor_heap heap = {0};
     uint32_t offset = 0;
@@ -626,7 +637,7 @@ uint64_t resource_at(device *dev, const descriptor_tracking &tracking, descripto
 }
 
 // The texture a table slot points at, or false for an empty or stale slot.
-bool read_texture(device *dev, const descriptor_tracking &tracking, descriptor_table table, uint32_t binding,
+bool read_texture(device *dev, const descriptor_tracker &tracking, descriptor_table table, uint32_t binding,
                   texture_entry &e)
 {
     descriptor_heap heap = {0};
@@ -768,7 +779,7 @@ void try_match(command_list *cmd, list_state &st, uint32_t param, descriptor_tab
         return;
 
     device *dev = cmd->get_device();
-    const auto *tracking = dev->get_private_data<descriptor_tracking>();
+    const auto *tracking = descriptor_tracker::of(dev);
     if (tracking == nullptr)
         return;
 
@@ -820,7 +831,7 @@ void trace_reads(command_list *cmd, list_state &st, bool graphics, uint32_t para
     if (watched == 0 || layout == nullptr)
         return;
     device *dev = cmd->get_device();
-    const auto *tracking = dev->get_private_data<descriptor_tracking>();
+    const auto *tracking = descriptor_tracker::of(dev);
     if (tracking == nullptr)
         return;
 
@@ -1079,7 +1090,7 @@ void check_redirect(command_list *cmd, list_state &st, uint32_t param, descripto
         return;
     const table_layout *layout = st.graphics.table(param);
     device *dev = cmd->get_device();
-    const auto *tracking = dev->get_private_data<descriptor_tracking>();
+    const auto *tracking = descriptor_tracker::of(dev);
     if (layout == nullptr || tracking == nullptr)
         return;
 
@@ -1186,7 +1197,7 @@ void check_delivery(command_list *cmd, list_state &st, uint32_t param, descripto
         return;
     const table_layout *layout = st.compute.table(param);
     device *dev = cmd->get_device();
-    const auto *tracking = dev->get_private_data<descriptor_tracking>();
+    const auto *tracking = descriptor_tracker::of(dev);
     if (layout == nullptr || layout->writes.empty() || tracking == nullptr)
         return;
 
@@ -1298,29 +1309,36 @@ void disarm(list_state &st, const char *why)
 
 // With Debug on: the game's jitter beside the projection terms that carry it,
 // for the first frames at each size, and how many distinct positions it cycles
-// through. The game's offset is in render pixels and its projection carries
-// it as (-2x / width, +2y / height) at 0x1a8 and 0x1b8, which is what DLSS
-// expects as given. A sign or unit mistake here shows only when upscaling.
+// through, counted again whenever jitter.cpp changes the sequence. The game's
+// offset is in render pixels and its projection carries it as (-2x / width,
+// +2y / height) at 0x1a8 and 0x1b8, which is what DLSS expects as given. A sign
+// or unit mistake here shows only when upscaling.
 void note_jitter(uint32_t width, uint32_t height, uint32_t output_width, float jx, float jy, const uint8_t *view_cb)
 {
     static uint64_t size = 0;
-    static uint32_t frames = 0, distinct = 0;
+    static uint32_t positions = 0, frames = 0, distinct = 0, detail = 0;
     static float seen[128][2];
     static float low[2], high[2];
     const uint64_t now = (uint64_t(width) << 32) | (uint64_t(height) << 16) | output_width;
-    if (now != size)
+    if (now != size || jitter_positions() != positions)
     {
+        if (now != size)
+            detail = 8;
         size = now;
+        positions = jitter_positions();
         frames = distinct = 0;
         low[0] = low[1] = FLT_MAX;
         high[0] = high[1] = -FLT_MAX;
     }
-    if (frames < 8)
+    if (detail != 0)
+    {
+        --detail;
         debug_event("jitter %.4f, %.4f px at %ux%u to %u wide; in NDC %.6f, %.6f by render size, %.6f by output "
                     "size; view constants 0x1a8 %.6f, 0x1b8 %.6f, 0x1c0 %.6f, 0x1c4 %.6f",
                     jx, jy, width, height, output_width, 2.0f * jx / float(width), -2.0f * jy / float(height),
                     2.0f * jx / float(output_width), read_float(view_cb, 0x1a8), read_float(view_cb, 0x1b8),
                     read_float(view_cb, 0x1c0), read_float(view_cb, 0x1c4));
+    }
     if (frames < 128)
     {
         bool known = false;
@@ -1337,9 +1355,9 @@ void note_jitter(uint32_t width, uint32_t height, uint32_t output_width, float j
         high[0] = std::max(high[0], jx);
         high[1] = std::max(high[1], jy);
         if (++frames == 128)
-            debug_event("jitter at %ux%u: %u distinct positions in 128 frames, x %.3f to %.3f, y %.3f to %.3f; "
-                        "DLSS asks for at least %.0f when upscaling this far",
-                        width, height, distinct, low[0], high[0], low[1], high[1],
+            debug_event("jitter at %ux%u, the game set to %u positions: %u distinct in 128 frames, x %.3f to "
+                        "%.3f, y %.3f to %.3f; DLSS asks for at least %.0f when upscaling this far",
+                        width, height, positions, distinct, low[0], high[0], low[1], high[1],
                         8.0 * double(output_width) * double(output_width) / (double(width) * double(width)));
     }
 }
@@ -1439,12 +1457,7 @@ bool replace(command_list *cmd, list_state &st)
 
     const float jx = read_float(taa_cb, cb::JITTER), jy = read_float(taa_cb, cb::JITTER + 4);
     prepare_constants k = make_constants(taa_cb, view_cb, width, height);
-    if (c.have_jitter)
-    {
-        k.jitter_delta[0] = (c.jitter[0] - jx) / float(width);
-        k.jitter_delta[1] = (c.jitter[1] - jy) / float(height);
-    }
-    k.jitter_delta[2] = camera_only ? 0.0f : 1.0f;
+    k.flags[0] = camera_only ? 0.0f : 1.0f;
 
     uint32_t history_valid;
     memcpy(&history_valid, taa_cb + cb::HISTORY_VALID, sizeof(history_valid));
@@ -1463,6 +1476,18 @@ bool replace(command_list *cmd, list_state &st)
     if (g_settings.debug)
         note_jitter(width, height, output_width, jx, jy, view_cb);
     frame.frame_ms = frame_time_ms(c);
+    {
+        // Device depth is PROJ_23 / z - PROJ_22, reversed: 1 at the near plane,
+        // 0 at the far one, which is infinitely far when PROJ_22 is 0.
+        const float p11 = read_float(view_cb, cb::PROJ_11);
+        const float p22 = read_float(view_cb, cb::PROJ_22), p23 = read_float(view_cb, cb::PROJ_23);
+        if (p11 > 0.0f && p23 > 0.0f && p22 > -1.0f)
+        {
+            frame.camera_near = p23 / (1.0f + p22);
+            frame.camera_far = p22 > 1e-7f ? p23 / p22 : FLT_MAX;
+            frame.camera_fov = 2.0f * std::atan(1.0f / p11);
+        }
+    }
     frame.hdr = hdr;
     frame.reset = history_valid == 0 || c.force_reset;
     if (frame.reset)
@@ -1471,6 +1496,7 @@ bool replace(command_list *cmd, list_state &st)
         ++g_counts.camera_only;
     g_counts.frame_us += uint64_t(frame.frame_ms * 1000.0f);
     frame.preset = g_settings.preset;
+    jitter_apply(width, output_width);
 
     // A new preset or size means a new DLSS feature, and the old one may still
     // be in flight.
@@ -1496,9 +1522,10 @@ bool replace(command_list *cmd, list_state &st)
     }
     if (!evaluated)
     {
-        // The game's TAA draws after all.
+        // The game's TAA draws after all, with its own jitter.
         c.work.abandon(list);
         restore(dev, list, st);
+        jitter_restore();
         c.failed = true;
         set_status(c, taa_state::failed, c.upscaler.error());
         acv_log(reshade::log::level::error,
@@ -1519,9 +1546,6 @@ bool replace(command_list *cmd, list_state &st)
     restore(dev, list, st);
     publish_upscale(target.handle, upscale ? c.work.presented() : nullptr, c.work.color_format(), st.graphics.layout);
 
-    c.jitter[0] = jx;
-    c.jitter[1] = jy;
-    c.have_jitter = true;
     c.force_reset = false;
     c.last_replaced = c.frame;
     g_taa_frame = g_frames.load();
@@ -1673,12 +1697,15 @@ void on_destroy_resource(device *, resource res)
 void on_destroy_command_list(command_list *cmd)
 {
     if (cmd->get_private_data<list_state>() != nullptr)
+    {
+        ++g_list_generation;
         cmd->destroy_private_data<list_state>();
+    }
 }
 
 void on_reset_command_list(command_list *cmd)
 {
-    if (list_state *s = cmd->get_private_data<list_state>())
+    if (list_state *s = find_state(cmd))
     {
         disarm(*s, "command list ended before a draw");
         s->reset();
@@ -1803,7 +1830,7 @@ bool on_any_draw(command_list *cmd)
     if (g_ctx == nullptr)
         return false;
     probe_scope probe(P_DRAW);
-    list_state *st = cmd->get_private_data<list_state>();
+    list_state *st = find_state(cmd);
     if (st == nullptr)
         return false;
     if (!st->trace.empty())
@@ -1852,7 +1879,7 @@ bool on_draw_indirect(command_list *cmd, indirect_command type, resource, uint64
 
 bool on_dispatch(command_list *cmd, uint32_t x, uint32_t y, uint32_t z)
 {
-    list_state *st = g_ctx != nullptr ? cmd->get_private_data<list_state>() : nullptr;
+    list_state *st = g_ctx != nullptr ? find_state(cmd) : nullptr;
     if (st == nullptr)
         return false;
     probe_scope probe(P_DRAW);
@@ -2049,7 +2076,6 @@ void check_device(context &c)
 
     // The menus have no TAA, so a minute without one is said once, with the
     // tables that came closest, and only if DLSS never ran at all.
-    const uint64_t NOTE_FRAMES = 3600;
     if (c.frame != NOTE_FRAMES || !c.ready || c.failed || !g_settings.enabled || g_taa_frame != 0)
         return;
     std::string text = "no TAA pass found in the first " + std::to_string(NOTE_FRAMES) +
@@ -2113,7 +2139,7 @@ void taa_register()
 {
     reshade::register_event<reshade::addon_event::copy_descriptor_tables>(on_copy_tables_begin);
     reshade::register_event<reshade::addon_event::update_descriptor_tables>(on_update_tables_begin);
-    descriptor_tracking::register_events();
+    descriptor_tracker::register_events();
     reshade::register_event<reshade::addon_event::copy_descriptor_tables>(on_copy_tables_end);
     reshade::register_event<reshade::addon_event::update_descriptor_tables>(on_update_tables_end);
     reshade::register_event<reshade::addon_event::init_device>(on_init_device);
@@ -2139,13 +2165,16 @@ void taa_unregister()
 {
     reshade::unregister_event<reshade::addon_event::copy_descriptor_tables>(on_copy_tables_begin);
     reshade::unregister_event<reshade::addon_event::update_descriptor_tables>(on_update_tables_begin);
-    descriptor_tracking::unregister_events();
+    descriptor_tracker::unregister_events();
     reshade::unregister_event<reshade::addon_event::copy_descriptor_tables>(on_copy_tables_end);
     reshade::unregister_event<reshade::addon_event::update_descriptor_tables>(on_update_tables_end);
 }
 
-// Returns whether DLSS replaced the TAA within the last IDLE_FRAMES, which is
-// gameplay rather than a menu, a loading screen or the map.
+// Whether this frame counts towards a pipeline cache rebuild: one where DLSS
+// replaced the TAA, which is play in the world. When DLSS is off, cannot run
+// or never finds the TAA (Anti-aliasing not on High), menus cannot be told
+// from play, so every frame counts; otherwise such a player would rebuild the
+// cache at every start.
 static bool present_frame(command_queue *queue, uint32_t display_width, uint32_t display_height)
 {
     std::lock_guard ctx_lock(g_ctx_lock);
@@ -2166,7 +2195,7 @@ static bool present_frame(command_queue *queue, uint32_t display_width, uint32_t
     if (g_settings.debug)
         debug_frame(c);
     if (!c.ready || c.failed)
-        return false;
+        return true;
     const taa_state before = c.status.state;
     if (!g_settings.enabled)
         set_status(c, taa_state::off);
@@ -2175,7 +2204,8 @@ static bool present_frame(command_queue *queue, uint32_t display_width, uint32_t
     if (before == taa_state::running && c.status.state == taa_state::waiting)
         debug_event("no TAA pass for %llu frames (a menu, a loading screen or the map)",
                     static_cast<unsigned long long>(IDLE_FRAMES));
-    return c.status.state == taa_state::running;
+    const bool never_found = g_taa_frame == 0 && c.frame > NOTE_FRAMES;
+    return c.status.state == taa_state::running || !g_settings.enabled || never_found;
 }
 
 void taa_present(command_queue *queue, uint32_t display_width, uint32_t display_height)
@@ -2191,7 +2221,6 @@ void taa_restart()
         return;
     std::lock_guard lock(g_ctx->lock);
     g_ctx->force_reset = true;
-    g_ctx->have_jitter = false;
 }
 
 taa_status taa_get_status()

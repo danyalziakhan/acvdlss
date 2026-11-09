@@ -11,6 +11,7 @@
 #include <imgui.h>
 #include <reshade.hpp>
 
+#include "jitter.h"
 #include "acvdlss.h"
 
 #include <algorithm>
@@ -147,6 +148,8 @@ static void set_enabled(bool enabled, const char *how)
     reshade::set_config_value(nullptr, SECTION, "Enabled", enabled);
     if (enabled)
         taa_restart();
+    else
+        jitter_restore(); // the game's TAA was made for its own 8 positions
     g_indicator_until = std::chrono::steady_clock::now() + INDICATOR_TIME;
 }
 
@@ -354,12 +357,6 @@ static void draw_window(effect_runtime *runtime)
     const taa_status s = taa_get_status();
     draw_status(s);
     draw_lod_bias();
-    if (const std::string warning = dlss_versions_warning(); !warning.empty())
-    {
-        ImGui::PushStyleColor(ImGuiCol_Text, WARNING_COLOR);
-        ImGui::TextWrapped("%s", warning.c_str());
-        ImGui::PopStyleColor();
-    }
     ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY(), top + STATUS_LINES * ImGui::GetTextLineHeightWithSpacing()));
     ImGui::Separator();
 
@@ -491,6 +488,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         load_settings();
         log_start();
         log_settings();
+        jitter_start();
         lod_register();
         taa_register();
         reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
@@ -501,7 +499,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_overlay("ACV DLSS", draw_window);
         break;
     case DLL_PROCESS_DETACH:
+        // The TAA hooks go first, so no frame can change the jitter again after
+        // the game gets its own back.
         taa_unregister();
+        jitter_restore();
         reshade::unregister_addon(module);
         break;
     }

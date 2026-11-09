@@ -17,6 +17,8 @@ struct dlss_frame
     uint32_t output_width = 0, output_height = 0; // what DLSS makes of it
     float jitter_x = 0.0f, jitter_y = 0.0f;
     float frame_ms = 0.0f;
+    // The game's camera, only passed along for frame generation tools.
+    float camera_near = 0.1f, camera_far = 10000.0f, camera_fov = 1.0f; // fov: vertical, radians
     bool hdr = false;
     bool reset = false;
     uint32_t preset = 0;

@@ -13,7 +13,7 @@ struct prepare_constants
     float inv_proj[16];
     float cam_to_world[12];
     float prev_view_proj[12];
-    float jitter_delta[4];
+    float flags[4]; // x: 1 when the game wrote motion vectors
 };
 static_assert(sizeof(prepare_constants) == 52 * 4, "prepare.hlsl expects 52 root constants");
 
@@ -47,7 +47,8 @@ public:
     // the TAA target for everything else that reads it. Every work texture is
     // then back in the state prepare() expects.
     void finish(ID3D12GraphicsCommandList *list, float sharpness, bool hdr, ID3D12Resource *taa_target);
-    // For when DLSS did not run after prepare(): only the states go back.
+    // Puts the inputs back in the writable state prepare() expects. finish()
+    // ends with it, and it is all that is needed when DLSS did not run.
     void abandon(ID3D12GraphicsCommandList *list);
 
     // Resamples presented() into a game texture in the unordered access state,

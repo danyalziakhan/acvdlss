@@ -19,6 +19,9 @@ recognizes that table when the game binds it, and on the next draw it:
 It skips the game's TAA and everything drawn after that works on the DLSS
 image, including the HUD.
 
+When DLSS upscales, the add-on has the game's camera cycle through 16 or 32
+sub-pixel positions instead of its usual 8, as NVIDIA recommends for DLSS.
+
 ## Resolution scale
 
 The game's **Resolution Scale** setting decides what DLSS does:
@@ -65,6 +68,9 @@ rebuilds the cache again.
 3. Copy `acvdlss.addon64` and `nvngx_dlss.dll` next to `ACValhalla.exe`, where
    ReShade's DLL is.
 4. Set **Anti-aliasing** to **High** in the game's graphics options.
+5. Start the game. The first start after installing or updating is slow while
+   the game rebuilds its pipeline cache. Play for 3 minutes with DLSS on after
+   it.
 
 ## Settings
 
@@ -98,6 +104,11 @@ Settings are saved to `ReShade.ini` under `[ACVDLSS]`.
 - Dialogue cutscenes work with DLSS too, including the letterboxed ones.
 - Don't combine it with any other mod that replaces the game's anti-aliasing.
   RenoDX DLSS is the exception, see below.
+- If interiors look far too bright, or shadows turn into blotches, with DLSS
+  on or off, the game's pipeline cache is damaged. That can happen when the
+  game crashes or is closed while it saves new shaders. Close the game and
+  delete the `cache` folder in `Documents\Assassin's Creed Valhalla`. The next
+  start is slow while the game builds it again.
 - ACV DLSS writes `acvdlss.log` next to `ACValhalla.exe`, started fresh each
   time the game starts. Attach it when you report a problem. Its warnings also
   appear in ReShade's log.
@@ -111,13 +122,11 @@ image.
 
 1. Install ACV DLSS as above.
 2. Put `renodx-dlss.addon64` and `nvngx_dlssnr.dll` next to `ACValhalla.exe` as
-   well.
-3. Preferably, use `nvngx_dlss.dll` and `nvngx_dlssnr.dll` from the same DLSS
-   release. Different versions should still work, but if the game crashes as
-   DLSS-NR starts, try matching them first.
+   well. Official and modified `nvngx_dlssnr.dll` builds both work: ACV DLSS
+   leaves DLSS 5 to RenoDX DLSS.
 
-Tested together: RenoDX DLSS 0.2026.1025.409, both NVIDIA DLLs at 310.9.16,
-ReShade 6.8.0.
+Tested together: RenoDX DLSS 0.2026.1025.409, `nvngx_dlss.dll` and
+`nvngx_dlssnr.dll` 310.9.16, ReShade 6.8.0.
 
 Running Lecram's DLSS 5 Neural Rendering (`renodx-dlss5.addon64`) alongside
 RenoDX DLSS isn't recommended. If you do, set its **Hook point** to
@@ -127,11 +136,9 @@ DLSS also there the game crashes as neural rendering starts.
 ## Don't stack FSR on a lower resolution scale
 
 The game's FSR stacks on top of the resolution scale, so 70% with FSR
-Performance renders at only 35% of your screen. The game's camera cycles
-through just 8 sub-pixel positions, which is enough for DLSS down to about 50%
-but not at very low render sizes, where foliage and shadows shimmer until DLSS
-settles. To render below your screen's resolution, keep the resolution scale
-at 100% and pick an FSR mode.
+Performance renders at only 35% of your screen. That's too little for DLSS:
+foliage and shadows shimmer until it settles. To render below your screen's
+resolution, keep the resolution scale at 100% and pick an FSR mode.
 
 ## Building
 
@@ -177,7 +184,7 @@ Output: `build\Release\acvdlss.addon64`.
 ## Third-party licenses
 
 - [ReShade](https://github.com/crosire/reshade), BSD 3-Clause, copyright Patrick
-  Mours. `descriptor_tracking.cpp` from its examples is built in.
+  Mours. The add-on is built against its add-on API headers.
 - [Dear ImGui](https://github.com/ocornut/imgui), MIT, copyright Omar Cornut.
 - [NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS), under the NVIDIA RTX SDKs
   license. DLSS and NVIDIA are trademarks of NVIDIA Corporation.
