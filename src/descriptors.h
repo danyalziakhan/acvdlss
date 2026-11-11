@@ -7,25 +7,23 @@
 #include <mutex>
 #include <unordered_map>
 
-// What the game wrote into each descriptor heap slot, so a bound table can be
-// read back: the view of an SRV or UAV, the buffer range of a CBV. The game
-// writes and copies thousands of descriptors a frame on several threads, so
-// this is built for that: a slot is found by shift and mask in chunks that
-// never move, without a lock, and a run of slots in one chunk is copied at
-// once. It answers the same as ReShade's descriptor_tracking example for the
-// two questions asked of it; samplers and pipeline layouts are not kept.
+// Tracks what the game writes into each descriptor heap slot (SRV/UAV views,
+// CBV buffer ranges) so bound tables can be read back. The game writes
+// thousands of descriptors a frame from several threads, so slots live in
+// fixed chunks indexed by shift and mask with no lock, and copies go a chunk
+// run at a time. Same answers as ReShade's descriptor_tracking example for
+// views and buffers; samplers and pipeline layouts aren't tracked.
 class __declspec(uuid("6a0e3c94-58d1-4f7b-a2c6-0b9e7d51f3a8")) descriptor_tracker
 {
 public:
     static void register_events();
     static void unregister_events();
 
-    // The device's tracker. The game has one device, so it is kept rather than
-    // looked up through ReShade on every call.
+    // The game has one device, so its tracker is cached instead of looked up
+    // through ReShade on every call.
     static descriptor_tracker *of(reshade::api::device *device);
 
-    // The view in a slot, or 0 for an empty slot, a slot without one, or a
-    // heap never written to.
+    // 0 if the slot is empty, holds no view, or the heap was never written.
     reshade::api::resource_view view(reshade::api::descriptor_heap heap, uint32_t offset) const;
     // The buffer range of a constant buffer or storage buffer slot, or empty.
     reshade::api::buffer_range buffer(reshade::api::descriptor_heap heap, uint32_t offset) const;
@@ -58,8 +56,8 @@ private:
     const heap_data *find_heap(uint64_t handle) const;
     heap_data *heap(uint64_t handle);
 
-    // Tells trackers apart in the per-thread cache, where an address could be
-    // a later tracker's.
+    // Identifies the tracker in the per-thread cache. An address could be
+    // reused by a later tracker.
     uint64_t _id;
     mutable std::mutex _lock; // guards _heaps; lookups take it only when the per-thread cache misses
     std::unordered_map<uint64_t, heap_data *> _heaps;

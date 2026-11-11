@@ -1,7 +1,6 @@
-// Turns the inputs of Valhalla's TAA pass into what DLSS reads: a copy of the
-// color, motion vectors in UV units pointing back to the previous frame, and
-// device depth. The copy exists because the game leaves its own textures in a
-// state only pixel shaders may read.
+// Converts Valhalla's TAA inputs for DLSS: a color copy, UV-space motion
+// vectors pointing to the previous frame, and device depth. Color is copied
+// because the game leaves its textures in a pixel-shader-only state.
 
 cbuffer constants : register(b0)
 {
@@ -21,8 +20,8 @@ RWTexture2D<float4> out_color : register(u0);
 RWTexture2D<float2> out_motion : register(u1);
 RWTexture2D<float> out_depth : register(u2);
 
-// Each component is 12 bits on a quartic curve, so small motion keeps its
-// precision. x is red and the top half of green, y the bottom half and blue.
+// 12 bits per component on a quartic curve to keep precision for small motion.
+// x is red plus the high nibble of green, y the low nibble plus blue.
 float unpack_motion(uint q)
 {
     float v = clamp(q * 0.000489 - 1.0, -1.0, 1.0);
@@ -30,10 +29,10 @@ float unpack_motion(uint q)
     return sign(v) * 0.2 * v2 * v2;
 }
 
-// Where the pixel was a frame ago if only the camera moved. The game only
-// gives the inverse projection for its far plane, so the point found there is
-// slid along the same ray to the pixel's own depth. The sky stays at the far
-// plane, as the game's TAA treats it.
+// Previous-frame UV assuming only the camera moved. The game's inverse
+// projection is only valid at the far plane, so we unproject there and scale
+// along the ray to the pixel's depth. Sky stays at the far plane, as in the
+// game's TAA.
 float2 reproject(float2 uv, float view_depth, bool sky)
 {
     float4 clip = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth_params.w, 1.0);
@@ -62,10 +61,10 @@ void main(uint3 id : SV_DispatchThreadID)
     float2 uv = (float2(p) + 0.5) * size.zw;
     bool sky = d >= depth_params.x;
 
-    // The sky, and every pixel of a dialogue cutscene (where the game binds a
-    // 4x4 placeholder instead of motion vectors), get the camera's motion. No
-    // jitter term: tested live with +1, 0, -1 and +2 times the change in
-    // jitter, only 0 keeps the clouds still.
+    // Sky pixels, and all pixels in dialogue cutscenes (the game binds a 4x4
+    // placeholder instead of motion vectors), get camera motion. No jitter
+    // term: tested +1, 0, -1 and +2 times the jitter delta, and only 0 keeps
+    // the clouds still.
     float2 motion;
     if (sky || flags.x == 0.0)
     {

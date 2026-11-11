@@ -1,6 +1,6 @@
-// RCAS, the sharpening pass of AMD FidelityFX Super Resolution 1, MIT license
-// (see the README). Sharpens by the largest amount that cannot overshoot the
-// five-tap neighborhood, and backs off where luma looks like noise.
+// RCAS from AMD FidelityFX Super Resolution 1, MIT license (see the README).
+// Sharpens as much as possible without overshooting the five-tap neighborhood,
+// and backs off where luma looks like noise.
 
 cbuffer constants : register(b0)
 {
@@ -18,7 +18,7 @@ static const float LOBE_LIMIT = 0.1875;
 float3 fetch(int2 p, int2 last)
 {
     float3 c = source[clamp(p, int2(0, 0), last)].rgb;
-    // A reversible curve keeps highlights inside the range the limits assume.
+    // Reversible tonemap so HDR highlights fit the 0..1 range RCAS assumes.
     return hdr > 0.0 ? c / (1.0 + max(c.r, max(c.g, c.b))) : c;
 }
 

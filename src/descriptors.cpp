@@ -10,9 +10,8 @@ using namespace reshade::api;
 
 namespace
 {
-// The heaps a thread used last. Writes come in long runs, and a copy reads one
-// heap and writes another, so a handful of entries skips the lookup and its
-// lock nearly every time.
+// Last few heaps this thread used. Writes come in long runs and a copy touches
+// two heaps, so four entries avoid the locked lookup almost every time.
 struct heap_cache
 {
     struct line
@@ -79,8 +78,7 @@ descriptor_tracker::entry *descriptor_tracker::heap_data::slot(uint32_t offset)
     entry *chunk = chunks[index].load(std::memory_order_acquire);
     if (chunk == nullptr)
     {
-        // Two threads may get here at once; the one that loses throws its
-        // chunk away and uses the winner's.
+        // Another thread may race us here. The loser frees its chunk.
         entry *fresh = new entry[CHUNK]();
         if (chunks[index].compare_exchange_strong(chunk, fresh, std::memory_order_acq_rel))
             chunk = fresh;
@@ -161,8 +159,8 @@ bool descriptor_tracker::on_update(device *device, uint32_t count, const descrip
             entry *e = data->slot(offset + k);
             if (e == nullptr)
                 break;
-            // The handle first, then what kind of slot it is: a reader on another
-            // thread never pairs a new type with an old handle.
+            // Write the handle before the type so a reader on another thread
+            // never pairs a new type with an old handle.
             switch (update.type)
             {
             case descriptor_type::sampler_with_resource_view:
@@ -211,8 +209,7 @@ bool descriptor_tracker::on_copy(device *device, uint32_t count, const descripto
         const heap_data *from = tracker->find_heap(src_heap.handle);
         heap_data *to = tracker->heap(dst_heap.handle);
 
-        // A run at a time: as far as both the source and the target stay in
-        // one chunk each.
+        // Copy in runs that stay within one source and one target chunk.
         for (uint32_t k = 0; k < copy.count;)
         {
             const uint32_t run = std::min({copy.count - k, CHUNK - ((src + k) & (CHUNK - 1)),

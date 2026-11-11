@@ -1,6 +1,6 @@
-// When DLSS upscales, the game still keeps its TAA output at render size: the
-// next frame's reflections and history read it. This fills that texture from
-// the DLSS image, so they see the same picture the screen does.
+// When DLSS upscales, the game's TAA output is still render size, and the next
+// frame's reflections and history read it. Fill it from the DLSS image so they
+// match what's on screen.
 
 Texture2D<float4> source : register(t0);
 SamplerState linear_clamp : register(s0);

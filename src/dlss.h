@@ -19,14 +19,17 @@ struct dlss_frame
     float frame_ms = 0.0f;
     // The game's camera, only passed along for frame generation tools.
     float camera_near = 0.1f, camera_far = 10000.0f, camera_fov = 1.0f; // fov: vertical, radians
+    // The final image before the HUD is drawn on it, and its resource state at
+    // Present. Also only for frame generation tools.
+    ID3D12Resource *hudless = nullptr;
+    uint32_t hudless_state = 0;
     bool hdr = false;
     bool reset = false;
     uint32_t preset = 0;
 };
 
-// One DLSS feature on one device, DLAA when the sizes match and upscaling when
-// they don't. Creation and evaluation both record into the game's command
-// list, which is where the frame is.
+// One DLSS feature on one device (DLAA when the sizes match). Creation and
+// evaluation both record into the game's command list.
 class dlss
 {
 public:

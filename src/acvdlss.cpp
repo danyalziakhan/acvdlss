@@ -11,7 +11,9 @@
 #include <imgui.h>
 #include <reshade.hpp>
 
+#include "config.h"
 #include "jitter.h"
+#include "reflex.h"
 #include "acvdlss.h"
 
 #include <algorithm>
@@ -29,8 +31,6 @@ using namespace reshade::api;
 extern "C" __declspec(dllexport) const char *NAME = "ACV DLSS";
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
     "Replaces Assassin's Creed Valhalla's anti-aliasing (TAA) with NVIDIA DLSS.";
-
-static const char *SECTION = "ACVDLSS";
 
 settings g_settings;
 
@@ -66,17 +66,15 @@ static int g_listen_frame = 0; // ImGui frame the key button was last drawn on
 static void save_preset(uint32_t preset)
 {
     const char letter[2] = {char('A' + preset - 1), '\0'};
-    reshade::set_config_value(nullptr, SECTION, "Preset", preset == 0 ? "Auto" : letter);
+    config_set("DLSS", "Preset", preset == 0 ? "Auto" : letter);
 }
 
 // Saved as the preset's letter, or Auto. Earlier versions saved NVIDIA's
 // number, which is read once and saved back as the letter.
 static uint32_t read_preset()
 {
-    char value[16] = "";
-    size_t size = sizeof(value);
-    if (!reshade::get_config_value(nullptr, SECTION, "Preset", value, &size))
-        return 0;
+    const std::string text = config_string("DLSS", "Preset", "Auto");
+    const char *value = text.c_str();
     if (value[0] >= '0' && value[0] <= '9')
     {
         const unsigned long number = strtoul(value, nullptr, 10);
@@ -92,19 +90,17 @@ static uint32_t read_preset()
 
 static void load_settings()
 {
-    bool enabled = true, debug = false;
-    int sharpness = 0;
-    reshade::get_config_value(nullptr, SECTION, "Enabled", enabled);
-    const uint32_t preset = read_preset();
-    reshade::get_config_value(nullptr, SECTION, "Sharpness", sharpness);
-    reshade::get_config_value(nullptr, SECTION, "Debug", debug);
-    g_settings.enabled = enabled;
-    g_settings.debug = debug;
-    g_settings.preset = preset;
-    g_settings.sharpness = float(std::clamp(sharpness, 0, 100)) / 100.0f;
+    config_open();
+    g_settings.enabled = config_int("General", "Enabled", 1) != 0;
+    g_settings.preset = read_preset();
+    g_settings.sharpness = float(std::clamp(config_int("DLSS", "Sharpness", 0), 0, 100)) / 100.0f;
+    g_settings.reflex = uint32_t(std::clamp(config_int("Latency", "Reflex", 0), 0, 2));
+    g_settings.hudless = config_int("OptiScaler", "HudlessImage", 1) != 0;
+    const int positions = config_int("Advanced", "JitterPositions", 0); // Auto reads as 0
+    g_settings.jitter_positions = positions == 8 || positions == 16 || positions == 32 ? uint32_t(positions) : 0;
+    g_settings.debug = config_int("Diagnostics", "Debug", 0) != 0;
 
-    int key = g_toggle_key;
-    reshade::get_config_value(nullptr, SECTION, "ToggleKey", key);
+    const int key = config_int("General", "ToggleKey", VK_F10);
     g_toggle_key = key >= 0 && key < 256 ? key : VK_F10;
 }
 
@@ -112,21 +108,30 @@ static std::string key_name(uint32_t vk);
 
 static void log_settings()
 {
-    char text[160];
-    snprintf(text, sizeof(text), "settings: %s, preset %s, sharpness %d%%, toggle key %s%s",
+    if (config_took_over())
+        acv_log(reshade::log::level::info, "settings moved from ReShade.ini to acvdlss.ini");
+    static const char *REFLEX[] = {"off", "on", "on + boost"};
+    char positions[16] = "auto";
+    if (g_settings.jitter_positions != 0)
+        snprintf(positions, sizeof(positions), "%u", g_settings.jitter_positions.load());
+    char text[256];
+    snprintf(text, sizeof(text),
+             "settings: %s, preset %s, sharpness %d%%, toggle key %s, Reflex %s, HUD-less image %s, jitter "
+             "positions %s%s",
              g_settings.enabled ? "on" : "off", PRESETS[g_settings.preset],
              int(std::lround(g_settings.sharpness * 100.0f)),
-             g_toggle_key != 0 ? key_name(g_toggle_key).c_str() : "none", g_settings.debug ? ", Debug on" : "");
+             g_toggle_key != 0 ? key_name(g_toggle_key).c_str() : "none", REFLEX[g_settings.reflex],
+             g_settings.hudless ? "on" : "off", positions, g_settings.debug ? ", Debug on" : "");
     acv_log(reshade::log::level::info, text);
 }
 
 static void save_toggle_key()
 {
-    reshade::set_config_value(nullptr, SECTION, "ToggleKey", g_toggle_key);
+    config_set("General", "ToggleKey", g_toggle_key);
 }
 
-// The indicator in the top left corner after DLSS is switched, so the toggle
-// key gives an answer with the overlay closed.
+// Top-left indicator shown after DLSS is switched, so the toggle key gives
+// feedback with the overlay closed.
 static const auto INDICATOR_TIME = std::chrono::seconds(3);
 static std::chrono::steady_clock::time_point g_indicator_until;
 
@@ -145,7 +150,7 @@ static void set_enabled(bool enabled, const char *how)
 {
     log_change("DLSS switched %s with %s", enabled ? "on" : "off", how);
     g_settings.enabled = enabled;
-    reshade::set_config_value(nullptr, SECTION, "Enabled", enabled);
+    config_set("General", "Enabled", enabled ? 1 : 0);
     if (enabled)
         taa_restart();
     else
@@ -158,7 +163,7 @@ static bool toggle_key_pressed()
     return g_toggle_key != 0 && g_runtime != nullptr && g_runtime->is_key_pressed(g_toggle_key);
 }
 
-// A key ReShade itself answers to would do both things at once.
+// A key ReShade already uses would trigger both.
 static bool is_reshade_key(int vk)
 {
     for (const char *name : {"KeyOverlay", "KeyEffects", "KeyScreenshot", "KeyReload", "KeyNextPreset",
@@ -249,9 +254,9 @@ static void draw_toggle_key(effect_runtime *runtime)
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Switches DLSS on and off while playing.\nBackspace while picking leaves it without a key.");
 
-    // Asked of ReShade rather than Windows, which reports every key as up while
-    // the overlay has the input. The frame listening starts on is skipped, so
-    // the Space or Enter that pressed the button is not taken as the answer.
+    // Ask ReShade, not Windows: Windows reports every key as up while the
+    // overlay has input. Skip the first frame so the Space or Enter that
+    // pressed the button isn't picked up.
     if (!g_listening || started || runtime == nullptr)
         return;
     // From the middle mouse button up: the left one pressed the button.
@@ -289,10 +294,9 @@ static std::string describe_mode(const taa_status &s)
     return std::string(text) + (s.hdr ? ", HDR" : "");
 }
 
-// The bias the game has now, and the one a restart would bring if FSR was
-// switched or changed since it started. Without FSR there is no bias, so the
-// line only shows when one of the two isn't 0. The settings file is read at
-// most once a second.
+// Current bias, plus the one a restart would apply if FSR changed since
+// launch. Hidden when both are 0 (no FSR). Reads the settings file at most
+// once a second.
 static void draw_lod_bias()
 {
     static float wanted = lod_bias();
@@ -342,8 +346,8 @@ static void draw_status(const taa_status &s)
     }
 }
 
-// The status takes up to two lines and the LOD bias one. Three are always kept
-// for them, so the controls below stay put when DLSS is switched.
+// Status takes up to two lines, LOD bias one. Always reserve three so the
+// controls don't move when DLSS is switched.
 static const int STATUS_LINES = 3;
 
 static void draw_window(effect_runtime *runtime)
@@ -379,7 +383,7 @@ static void draw_window(effect_runtime *runtime)
     if (ImGui::SliderInt("Sharpness", &sharpness, 0, 100, "%d%%"))
     {
         g_settings.sharpness = float(sharpness) / 100.0f;
-        reshade::set_config_value(nullptr, SECTION, "Sharpness", sharpness);
+        config_set("DLSS", "Sharpness", sharpness);
     }
     // Logged once the drag ends, and only if it ended somewhere new.
     static int dragged_from = 0;
@@ -389,6 +393,24 @@ static void draw_window(effect_runtime *runtime)
         log_change("sharpness set to %d%%", sharpness);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("AMD's RCAS, run on the DLSS output before the HUD is drawn.");
+
+    static const char *REFLEX[] = {"Off", "On", "On + Boost"};
+    const char *no_reflex = reflex_unavailable();
+    ImGui::BeginDisabled(no_reflex != nullptr);
+    int reflex = int(g_settings.reflex);
+    if (ImGui::Combo("NVIDIA Reflex", &reflex, REFLEX, int(std::size(REFLEX))))
+    {
+        g_settings.reflex = uint32_t(reflex);
+        config_set("Latency", "Reflex", reflex);
+        log_change("Reflex set to %s", REFLEX[reflex]);
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s", no_reflex != nullptr
+                                    ? no_reflex
+                                    : "Cuts render queue latency, so input reaches the screen sooner.\n"
+                                      "Boost holds GPU clocks high when the CPU is the bottleneck, at some "
+                                      "power cost.");
 }
 
 // ReShade raises this every frame, overlay open or not, inside its ImGui frame.
@@ -397,8 +419,7 @@ static void on_overlay(effect_runtime *)
     if (std::chrono::steady_clock::now() >= g_indicator_until)
         return;
 
-    // Green only while DLSS is running. Otherwise amber, with the reason, and
-    // the window has the details.
+    // Green only while DLSS is running, otherwise amber. The window has details.
     const taa_status s = taa_get_status();
     std::string text;
     ImVec4 color = WARNING_COLOR;
@@ -491,6 +512,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         jitter_start();
         lod_register();
         taa_register();
+        reflex_register();
         reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);
         reshade::register_event<reshade::addon_event::reshade_open_overlay>(on_open_overlay);
@@ -499,9 +521,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_overlay("ACV DLSS", draw_window);
         break;
     case DLL_PROCESS_DETACH:
-        // The TAA hooks go first, so no frame can change the jitter again after
-        // the game gets its own back.
+        // Unhook the TAA first so no frame can change the jitter after it's
+        // restored.
         taa_unregister();
+        reflex_unregister();
         jitter_restore();
         reshade::unregister_addon(module);
         break;

@@ -24,11 +24,15 @@
 // Any stable GUID works as a project ID for NGX; this one is ours.
 static const char *PROJECT_ID = "5c3f9a1e-7b2d-4e8a-9f61-0d4c2b7e3a95";
 
-// Whether a file carries a valid signature, so a report tells an official
-// nvngx_dlssnr.dll from a modified one: NGX only loads signed ones. Cached
-// certificate data only, so start-up never waits on the network.
+// Lets a report tell an official nvngx_dlssnr.dll from a modified one, since
+// NGX only loads signed DLLs. Cached certificate data only, so startup never
+// waits on the network.
 static const char *signature_of(const std::wstring &path)
 {
+#ifdef ACVDLSS_PLAIN
+    (void)path;
+    return "(signature not checked in this build)";
+#else
     WINTRUST_FILE_INFO file = {sizeof(file)};
     file.pcwszFilePath = path.c_str();
     WINTRUST_DATA data = {sizeof(data)};
@@ -43,6 +47,7 @@ static const char *signature_of(const std::wstring &path)
     data.dwStateAction = WTD_STATEACTION_CLOSE;
     WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action, &data);
     return result == ERROR_SUCCESS ? "signed" : result == LONG(TRUST_E_NOSIGNATURE) ? "unsigned" : "signature invalid";
+#endif
 }
 
 // The DLSS DLLs beside the game, for reports: RenoDX DLSS runs DLSS 5 (neural
@@ -117,18 +122,17 @@ bool dlss::init(ID3D12Device *device, bool log)
         info.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_ON;
     }
 
-    // NGX does not say when the DLL is missing, only that DLSS is, so the file
-    // is looked for here to give the likeliest reason first.
+    // NGX doesn't report a missing DLL as such, so check for it ourselves to
+    // give a useful error.
     const std::wstring dll = folder + L"\\nvngx_dlss.dll";
     const bool dll_missing = GetFileAttributesW(dll.c_str()) == INVALID_FILE_ATTRIBUTES;
     const char *const MISSING = "nvngx_dlss.dll is not in the game folder";
 
-    // NGX writes its own log files into the application data folder, so it
-    // gets a folder of its own.
+    // NGX writes log files into its data folder, so give it a separate one.
     const std::wstring data = folder + L"\\acvdlss";
     CreateDirectoryW(data.c_str(), nullptr);
-    // DLSS 5 stays out of our start-up (see ngx_guard.h); NGX may load its
-    // features both while starting and while reporting what it supports.
+    // Keep DLSS 5 out of our startup (see ngx_guard.h). NGX may load features
+    // both in Init and in GetCapabilityParameters.
     std::optional<ngx_guard> guard(std::in_place, folder);
     NVSDK_NGX_Result result = NVSDK_NGX_D3D12_Init_with_ProjectID(
         PROJECT_ID, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0", data.c_str(), device, &info);
@@ -219,9 +223,9 @@ bool dlss::create(ID3D12GraphicsCommandList *list, const dlss_frame &frame)
     create.Feature.InTargetWidth = frame.output_width;
     create.Feature.InTargetHeight = frame.output_height;
     create.Feature.InPerfQualityValue = quality_for(frame);
-    // The game's depth is reversed and its motion vectors carry no jitter.
-    // The game hands over no exposure value, so DLSS measures it, for SDR
-    // frames too: players of other games report less ghosting with it.
+    // Depth is reversed and motion vectors have no jitter. There's no exposure
+    // value to pass, so use auto exposure, in SDR too: players report less
+    // ghosting with it in other games.
     create.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
                                   NVSDK_NGX_DLSS_Feature_Flags_DepthInverted |
                                   NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
@@ -242,7 +246,7 @@ bool dlss::create(ID3D12GraphicsCommandList *list, const dlss_frame &frame)
     _hdr = frame.hdr;
     _preset = frame.preset;
     _error.clear();
-    // Once per size or preset change, so it is logged without Debug too.
+    // Only on size or preset changes, so log it even without Debug.
     char text[160];
     snprintf(text, sizeof(text), "DLSS created: %ux%u to %ux%u, %s mode, preset %s%s", frame.width, frame.height,
              frame.output_width, frame.output_height, quality_name(create.Feature.InPerfQualityValue),
@@ -282,11 +286,16 @@ bool dlss::evaluate(ID3D12GraphicsCommandList *list, const dlss_frame &frame)
     eval.InMVScaleX = float(frame.width);
     eval.InMVScaleY = float(frame.height);
     eval.InFrameTimeDeltaInMsec = frame.frame_ms;
-    // Not used by DLSS. Tools that take DLSS's inputs for frame generation
-    // read the camera under these names when a game provides them.
+    // Ignored by DLSS. Frame generation tools that hook DLSS read the camera
+    // from these names.
     NVSDK_NGX_Parameter_SetF(_params, "FSR.cameraNear", frame.camera_near);
     NVSDK_NGX_Parameter_SetF(_params, "FSR.cameraFar", frame.camera_far);
     NVSDK_NGX_Parameter_SetF(_params, "FSR.cameraFovAngleVertical", frame.camera_fov);
+    // OptiScaler's frame generation uses this as the HUD-less image instead of
+    // searching for one (its HUD fix). The parameter block persists across
+    // frames, so this is also set (to null) when off.
+    NVSDK_NGX_Parameter_SetD3d12Resource(_params, "Opti.Hudless", frame.hudless);
+    NVSDK_NGX_Parameter_SetUI(_params, "Opti.Hudless.State", frame.hudless_state);
 
     const NVSDK_NGX_Result result = NGX_D3D12_EVALUATE_DLSS_EXT(list, _feature, _params, &eval);
     if (NVSDK_NGX_FAILED(result))

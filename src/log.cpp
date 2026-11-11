@@ -1,7 +1,6 @@
-// The add-on's own log: acvdlss.log next to the game's exe, started fresh each
-// session and written line by line, so a crash keeps everything before it.
-// Warnings and errors go to ReShade's log as well, where its Log tab shows
-// them among the other add-ons'.
+// acvdlss.log next to the game's exe. Truncated each session and flushed per
+// line so a crash keeps everything before it. Warnings and errors also go to
+// ReShade's log.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -86,9 +85,8 @@ static std::string acf_value(const std::string &text, const char *key)
     return end == std::string::npos ? std::string() : text.substr(at + 1, end - at - 1);
 }
 
-// The game's exe carries no version. A Steam copy has its build number in the
-// app manifest beside the library's common folder; any other copy, Ubisoft
-// Connect's included, gets the exe's date instead. Only files are read.
+// The exe has no version resource. Steam copies get the build ID from the app
+// manifest; other copies (Ubisoft Connect included) get the exe's date.
 static std::string game_build()
 {
     wchar_t exe[MAX_PATH] = L"";
@@ -134,8 +132,8 @@ static std::string game_build()
     return text;
 }
 
-// What a report needs before anything else: which build, which game, which
-// ReShade, and the game's own settings that change what the add-on does.
+// Versions of the add-on, ReShade and the game, plus the game settings that
+// affect the add-on.
 void log_start()
 {
     HMODULE self = nullptr;
@@ -191,11 +189,10 @@ static std::string where(DWORD64 address)
     return text;
 }
 
-// The game's own crash handling ends the process without a word in our log,
-// so access violations are written down where they happen: the module and
-// offset, what was read or written, and the call stack, walked from the
-// faulting frame. A game can raise and handle one on purpose, so this is
-// capped and says "if the game crashed".
+// The game's crash handler kills the process without anything reaching our
+// log, so log access violations as they happen, with a call stack. Games can
+// raise and handle these on purpose, hence the cap and the "if the game
+// crashed" wording.
 static LONG CALLBACK on_exception(EXCEPTION_POINTERS *info)
 {
     if (info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
@@ -269,10 +266,9 @@ void log_adapter(ID3D12Device *device)
     acv_log(reshade::log::level::info, line.c_str());
 }
 
-// Every module loaded from the game's folder, which is where mods live, and
-// NVIDIA's NGX modules wherever they are, with their versions. Another
-// upscaler, an older nvngx_dlss.dll or a second DLSS-NR is what most reports
-// come down to.
+// Modules loaded from the game folder (where mods live) and NGX modules from
+// anywhere, with versions. Most bug reports come down to another upscaler, an
+// old nvngx_dlss.dll or a second DLSS-NR.
 void log_modules()
 {
     const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());

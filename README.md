@@ -1,7 +1,7 @@
 # ACV DLSS
 
 ReShade add-on that replaces Assassin's Creed Valhalla's own anti-aliasing (TAA)
-with NVIDIA DLSS.
+with NVIDIA DLSS, with experimental NVIDIA Reflex.
 
 Needs an NVIDIA RTX graphics card.
 
@@ -38,6 +38,11 @@ The game's **Resolution Scale** setting decides what DLSS does:
   best way to render below your screen's resolution, because textures keep
   their full detail (see below).
 
+> [!WARNING]
+> **Leave the game's Adaptive Quality off.** Dynamic resolution isn't supported
+> yet. With it on, the picture flickers between DLSS and the game's TAA
+> whenever the internal render resolution changes.
+
 ## Texture detail
 
 The game loads texture detail for the resolution scale's size. FSR renders
@@ -50,9 +55,8 @@ NVIDIA's guidelines add another -1 on top. In this game that asks for detail
 it never loads, and the ground turns black up close where leaves and debris
 lie, so it isn't used.
 
-DLSS picks up a new resolution scale or FSR mode straight away, but the LOD
-bias needs a restart, because the game builds it into its pipelines at start
-up. The first start after the bias changes is slow while the game rebuilds its
+DLSS picks up a new FSR mode straight away, but the LOD bias needs a restart,
+because the game builds it into its pipelines at start up. The first start after the bias changes is slow while the game rebuilds its
 pipeline cache. Play for 3 minutes with DLSS on after it, or the next start
 rebuilds the cache again.
 
@@ -65,8 +69,8 @@ rebuilds the cache again.
 1. Install ReShade 6.8 or newer with add-on support.
 2. Download the latest DLSS DLL from
    [TechPowerUp](https://www.techpowerup.com/download/nvidia-dlss-dll/).
-3. Copy `acvdlss.addon64` and `nvngx_dlss.dll` next to `ACValhalla.exe`, where
-   ReShade's DLL is.
+3. Copy `acvdlss.addon64`, `acvdlss.ini` and `nvngx_dlss.dll` next to
+   `ACValhalla.exe`, where ReShade's DLL is.
 4. Set **Anti-aliasing** to **High** in the game's graphics options.
 5. Start the game. The first start after installing or updating is slow while
    the game rebuilds its pipeline cache. Play for 3 minutes with DLSS on after
@@ -94,8 +98,76 @@ what DLSS is doing right now, and the LOD bias when FSR is on.
   ![The preset list open](nexus/2-presets.png)
 
 - **Sharpness** applies AMD's RCAS to the DLSS image before the HUD is drawn.
+- **NVIDIA Reflex** is experimental, see below.
 
-Settings are saved to `ReShade.ini` under `[ACVDLSS]`.
+All settings are saved in `acvdlss.ini` next to `ACValhalla.exe`. These can
+only be changed there:
+
+- `HudlessImage` under `[OptiScaler]`, see the frame generation section.
+- `JitterPositions` under `[Advanced]`: `Auto`, or force 8, 16 or 32 camera
+  positions.
+- `Debug` under `[Diagnostics]` writes a detailed log.
+
+## NVIDIA Reflex (experimental)
+
+Reflex is a work in progress and off by default.
+
+- **On** keeps frames from queueing up for the graphics card, so your input
+  reaches the screen sooner. In testing, GPU bound at about 35 fps, it cut
+  input latency by about a third, with no loss in frame rate.
+- **On + Boost** also keeps the graphics card's clocks up when the CPU is the
+  limit. It makes no difference while the graphics card is the limit.
+- It's switched off by itself, with the option greyed out, while OptiScaler's
+  frame generation is in use. See the next section.
+- It overrides frame rate caps that work through Reflex, like RTSS in Reflex
+  mode or the NVIDIA App's Max Frame Rate. Use the game's own frame limit
+  instead.
+
+## Frame generation with OptiScaler
+
+ACV DLSS gives the game a real DLSS integration, so
+[OptiScaler](https://github.com/optiscaler/OptiScaler) can run frame generation
+from it: DLSS frame generation, FSR frame generation or XeSS frame generation.
+Tested with an OptiScaler nightly build (10.0.0-dev, November 2026).
+
+Setup:
+
+1. Install ACV DLSS as above.
+2. Install OptiScaler as `winmm.dll` next to `ACValhalla.exe`.
+3. Rename ReShade's DLL (usually `dxgi.dll`) to `ReShade64.dll` and set
+   `LoadReshade = true` in `OptiScaler.ini`, so OptiScaler loads ReShade. With
+   ReShade as `dxgi.dll`, frame generation crashes.
+4. In `OptiScaler.ini`, set `FGInput = upscaler` and `FGOutput` to `dlssg`,
+   `fsrfg` or `xefg`. Then start the game and press **End** to switch frame
+   generation on or off.
+
+Things to know:
+
+- **No HUD fix needed.** ACV DLSS hands OptiScaler the picture before the HUD
+  is drawn, so the HUD stays sharp in generated frames with OptiScaler's
+  **HUDFix** off.
+- **Reflex is switched off** while `FGOutput` is set to a frame generation
+  output. Together with frame generation it hung the GPU in testing, and
+  OptiScaler handles latency on its own anyway.
+- **Recommended: switch frame generation off before loading screens.** Loading
+  a save or fast travelling with it on has frozen the game in testing. Press
+  **End** before, and turn it back on once you're in.
+- **A rare freeze at the title screen** has been seen with all three outputs.
+  If the game stops responding right after start, restart it. It's being
+  looked into.
+- **Disable RTSS for the game.** In RTSS, add `ACValhalla.exe` and set its
+  **Application detection level** to **None**. OptiScaler warns about RTSS,
+  and its Reflex injection interferes with frame generation's latency
+  handling.
+
+How the outputs behaved in testing:
+
+- **DLSS frame generation** (`dlssg`): smooth, with NVIDIA's own latency
+  handling while it's on. Needs an RTX 40 or 50 card, or a community
+  replacement DLL on older cards, like `dlssg_for_sm86` for RTX 30.
+- **FSR frame generation** (`fsrfg`): runs on any RTX card.
+- **XeSS frame generation** (`xefg`): runs on any RTX card, with Intel's
+  latency handling on the whole time.
 
 ## Good to know
 
@@ -110,8 +182,8 @@ Settings are saved to `ReShade.ini` under `[ACVDLSS]`.
   delete the `cache` folder in `Documents\Assassin's Creed Valhalla`. The next
   start is slow while the game builds it again.
 - ACV DLSS writes `acvdlss.log` next to `ACValhalla.exe`, started fresh each
-  time the game starts. Attach it when you report a problem. Its warnings also
-  appear in ReShade's log.
+  time the game starts. Attach it together with `acvdlss.ini` when you report a
+  problem. Its warnings also appear in ReShade's log.
 
 ## With RenoDX DLSS
 
@@ -137,7 +209,7 @@ DLSS also there the game crashes as neural rendering starts.
 
 The game's FSR stacks on top of the resolution scale, so 70% with FSR
 Performance renders at only 35% of your screen. That's too little for DLSS:
-foliage and shadows shimmer until it settles. To render below your screen's
+foliage and shadows shimmer noticeably. To render below your screen's
 resolution, keep the resolution scale at 100% and pick an FSR mode.
 
 ## Building
@@ -179,7 +251,9 @@ cmake --build build --config Release
 ```
 
 The shaders are compiled with `fxc` from the Windows SDK during the build.
-Output: `build\Release\acvdlss.addon64`.
+Output: `build\Release\acvdlss.addon64`. The default `acvdlss.ini` is built
+into the add-on from the repository's copy, which also goes into the release
+zip.
 
 ## Third-party licenses
 
@@ -188,6 +262,8 @@ Output: `build\Release\acvdlss.addon64`.
 - [Dear ImGui](https://github.com/ocornut/imgui), MIT, copyright Omar Cornut.
 - [NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS), under the NVIDIA RTX SDKs
   license. DLSS and NVIDIA are trademarks of NVIDIA Corporation.
+- `src\reflex.cpp` declares a few structures and interface IDs from
+  [NVIDIA's NvAPI](https://github.com/NVIDIA/nvapi), MIT.
 - `shaders\rcas.hlsl` follows RCAS from AMD FidelityFX Super Resolution 1, MIT,
   copyright Advanced Micro Devices, Inc.
 

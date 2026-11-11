@@ -35,8 +35,15 @@ struct settings
     std::atomic<bool> enabled{true};
     std::atomic<uint32_t> preset{0}; // NVIDIA's value: 0 lets DLSS choose, 1..13 are A..M
     std::atomic<float> sharpness{0.0f}; // 0..1, 0 skips RCAS
+    std::atomic<uint32_t> reflex{0};    // reflex_mode
+    // Only in acvdlss.ini: 0 picks from the upscaling ratio, else 8, 16 or 32.
+    std::atomic<uint32_t> jitter_positions{0};
     // Only in ReShade.ini: detailed logging, every frame if need be.
     std::atomic<bool> debug{false};
+    // Only in ReShade.ini: give frame generation tools the image without the
+    // HUD. Turn off if an effect drawn after the TAA looks wrong in generated
+    // frames.
+    std::atomic<bool> hudless{true};
 };
 extern settings g_settings;
 
@@ -69,19 +76,18 @@ void taa_present(reshade::api::command_queue *queue, uint32_t display_width, uin
 // own TAA ran in between.
 void taa_restart();
 taa_status taa_get_status();
-// Texture LOD bias, set on the game's samplers as they are created.
-// Called as the add-on loads, which ReShade does inside D3D12CreateDevice,
-// before the game has a device to build pipelines with. It may clear the
-// pipeline cache.
+// Sets a texture LOD bias on the game's samplers as they are created. Runs at
+// add-on load, which ReShade does inside D3D12CreateDevice, before the game
+// can build pipelines. May clear the pipeline cache.
 void lod_register();
-// Once a frame: marks a pipeline cache this session cleared as rebuilt after
-// enough play, which is frames where DLSS replaced the TAA, or any steady
-// frames while it is off or cannot run.
+// Once a frame. Marks a pipeline cache cleared this session as rebuilt after
+// enough frames with DLSS replacing the TAA, or enough steady frames while
+// DLSS is off or can't run.
 void lod_frame(bool gameplay);
-// The bias for how much smaller FSR renders inside the resolution scale's
-// size, 1 with FSR off.
+// Bias for FSR rendering below the resolution scale's size. fsr_ratio is 1
+// with FSR off.
 float lod_bias_for(float fsr_ratio);
-// The bias the game's settings file asks for now, which a restart would bring.
+// The bias the game's current settings file asks for, applied on restart.
 float lod_bias_saved();
 float lod_bias();             // 0 when none was applied
 uint32_t lod_biased_samplers();

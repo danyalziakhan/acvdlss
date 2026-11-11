@@ -31,8 +31,8 @@ public:
     bool init(ID3D12Device *device);
     void shutdown();
 
-    // Rebuilds the work textures when a size or the color format changes. The
-    // old ones stay alive until `frame` is far enough behind.
+    // Recreates the work textures when a size or the color format changes. Old
+    // ones are kept until `frame` is far enough behind.
     bool resize(uint32_t width, uint32_t height, uint32_t output_width, uint32_t output_height,
                 DXGI_FORMAT color_format, uint64_t frame);
     void collect(uint64_t frame);
@@ -41,19 +41,18 @@ public:
     void prepare(ID3D12GraphicsCommandList *list, const game_texture &color, const game_texture &motion,
                  const game_texture &depth, const prepare_constants &constants);
 
-    // Sharpens if asked and hands the result over. At DLAA it is copied into
-    // the game's TAA target. When upscaling, it goes into presented() for the
-    // pass that scales the frame to the screen, and a render-size copy into
-    // the TAA target for everything else that reads it. Every work texture is
-    // then back in the state prepare() expects.
+    // Optionally sharpens, then copies the result into the game's TAA target.
+    // When upscaling, the full-size result goes to presented() for the pass
+    // that scales to the screen, and a downsampled copy to the TAA target for
+    // everything else. Leaves the work textures in the state prepare() expects.
     void finish(ID3D12GraphicsCommandList *list, float sharpness, bool hdr, ID3D12Resource *taa_target);
-    // Puts the inputs back in the writable state prepare() expects. finish()
-    // ends with it, and it is all that is needed when DLSS did not run.
+    // Returns the inputs to the UAV state prepare() expects. Called by finish(),
+    // and on its own when DLSS didn't run.
     void abandon(ID3D12GraphicsCommandList *list);
 
-    // Resamples presented() into a game texture in the unordered access state,
-    // at its own size and format. This is how the frame reaches the screen
-    // when the game's own FSR 1 upscales.
+    // Resamples presented() into a game texture (in UAV state) at its size and
+    // format. This is how the frame reaches the screen when the game's FSR 1
+    // upscales.
     void deliver(ID3D12GraphicsCommandList *list, ID3D12Resource *target, DXGI_FORMAT format, uint32_t width,
                  uint32_t height);
 
@@ -63,8 +62,11 @@ public:
     ID3D12Resource *motion() const { return _motion; }
     ID3D12Resource *depth() const { return _depth; }
     ID3D12Resource *output() const { return _output; }
-    // The upscaled frame, always readable by any shader between frames.
+    // The upscaled frame. Readable by any shader between frames.
     ID3D12Resource *presented() const { return _presented; }
+    // The image finish() produced for this sharpness, and its state after the
+    // frame's passes.
+    ID3D12Resource *screen_image(float sharpness, uint32_t &state) const;
     DXGI_FORMAT color_format() const { return _color_format; }
     const std::string &error() const { return _error; }
 
@@ -88,9 +90,9 @@ private:
     uint32_t _increment = 0;
     uint32_t _next_slot = 0;
 
-    // Render size: what the game hands over.
+    // Render size.
     ID3D12Resource *_color = nullptr, *_motion = nullptr, *_depth = nullptr, *_downsampled = nullptr;
-    // Output size: what DLSS makes.
+    // Output size.
     ID3D12Resource *_output = nullptr, *_sharpened = nullptr, *_presented = nullptr;
     uint32_t _width = 0, _height = 0, _output_width = 0, _output_height = 0;
     DXGI_FORMAT _color_format = DXGI_FORMAT_UNKNOWN;

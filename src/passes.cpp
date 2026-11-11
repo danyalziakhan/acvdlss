@@ -6,13 +6,13 @@
 
 #include <cstdio>
 #include <iterator>
+#include <utility>
 
-// Six descriptors per dispatch: three inputs, three outputs. At most three
-// dispatches a frame, so a slot comes round again after 21 frames, far more
-// than the GPU ever trails behind.
+// Six descriptors per dispatch (three in, three out). At most three dispatches
+// a frame, so a slot is reused after 21 frames, far more than the GPU lags.
 static const uint32_t SLOT_SIZE = 6;
 static const uint32_t SLOT_COUNT = 64;
-// Frames a retired texture is kept for. The game queues at most three.
+// The game queues at most three frames.
 static const uint64_t RETIRE_FRAMES = 8;
 
 static const D3D12_RESOURCE_STATES READABLE =
@@ -185,6 +185,14 @@ bool passes::resize(uint32_t width, uint32_t height, uint32_t output_width, uint
     _output = make_texture(color_format, output_width, output_height, uav);
     _sharpened = make_texture(color_format, output_width, output_height, uav);
     bool ok = _color && _motion && _depth && _output && _sharpened;
+    // Named for GPU crash dumps, which list allocations near a page fault.
+    const std::pair<ID3D12Resource *, const wchar_t *> names[] = {
+        {_color, L"ACV DLSS input color"}, {_motion, L"ACV DLSS input motion"}, {_depth, L"ACV DLSS input depth"},
+        {_output, L"ACV DLSS output"},     {_sharpened, L"ACV DLSS sharpened"},
+    };
+    for (const auto &[texture, name] : names)
+        if (texture != nullptr)
+            texture->SetName(name);
     if (upscaling())
     {
         _downsampled = make_texture(color_format, width, height, uav);
@@ -237,7 +245,7 @@ D3D12_GPU_DESCRIPTOR_HANDLE passes::next_slot(D3D12_CPU_DESCRIPTOR_HANDLE &cpu)
     return gpu;
 }
 
-// A null resource still needs a format and a dimension, and reads as zeros.
+// A null view still needs a format and dimension. It reads as zeros.
 void passes::write_srv(D3D12_CPU_DESCRIPTOR_HANDLE at, ID3D12Resource *resource, DXGI_FORMAT format)
 {
     D3D12_SHADER_RESOURCE_VIEW_DESC desc = {};
@@ -256,8 +264,8 @@ void passes::write_uav(D3D12_CPU_DESCRIPTOR_HANDLE at, ID3D12Resource *resource,
     _device->CreateUnorderedAccessView(resource, nullptr, &desc, at);
 }
 
-// One source in our color format and one target, as RCAS, the downsample pass
-// and the delivery to the game's FSR 1 output all have.
+// One source in our color format, one target. Used by RCAS, downsample and
+// deliver().
 void passes::dispatch(ID3D12GraphicsCommandList *list, ID3D12PipelineState *pipeline, const void *constants,
                       uint32_t constant_count, ID3D12Resource *source, ID3D12Resource *target,
                       DXGI_FORMAT target_format, uint32_t width, uint32_t height)
@@ -326,8 +334,8 @@ void passes::finish(ID3D12GraphicsCommandList *list, float sharpness, bool hdr, 
     const D3D12_RESOURCE_BARRIER to_read = transition(result, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, READABLE);
     list->ResourceBarrier(1, &to_read);
 
-    // The render-size picture for the game's TAA target: DLSS's own at DLAA,
-    // the upscaled one brought back down otherwise.
+    // The TAA target is render size: DLSS output at DLAA, downsampled when
+    // upscaling.
     ID3D12Resource *for_taa = result;
     if (upscaling())
     {
@@ -344,8 +352,8 @@ void passes::finish(ID3D12GraphicsCommandList *list, float sharpness, bool hdr, 
         for_taa = _downsampled;
     }
 
-    // The game draws its TAA into this target, so it is a render target now
-    // and has to be one again for whatever reads it next.
+    // The game's TAA draws into this target, so it's a render target now and
+    // must be one again afterwards.
     const D3D12_RESOURCE_BARRIER to_copy =
         transition(taa_target, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
     list->ResourceBarrier(1, &to_copy);
@@ -362,6 +370,19 @@ void passes::finish(ID3D12GraphicsCommandList *list, float sharpness, bool hdr, 
     abandon(list);
 }
 
+ID3D12Resource *passes::screen_image(float sharpness, uint32_t &state) const
+{
+    // When upscaling, the full-size image is the copy delivered later. At DLAA
+    // it's the one finish() copied into the TAA target.
+    if (upscaling())
+    {
+        state = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
+        return _presented;
+    }
+    state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    return sharpness > 0.0f ? _sharpened : _output;
+}
+
 void passes::abandon(ID3D12GraphicsCommandList *list)
 {
     const D3D12_RESOURCE_BARRIER writable[] = {
@@ -375,8 +396,8 @@ void passes::abandon(ID3D12GraphicsCommandList *list)
 void passes::deliver(ID3D12GraphicsCommandList *list, ID3D12Resource *target, DXGI_FORMAT format, uint32_t width,
                      uint32_t height)
 {
-    // The downsample pass samples by position, so it fits any size, and at one
-    // to one it is a plain copy that converts formats.
+    // The downsample pass samples by UV, so it handles any size. At 1:1 it's a
+    // format-converting copy.
     dispatch(list, _downsample, nullptr, 0, _presented, target, format, width, height);
     D3D12_RESOURCE_BARRIER written = {};
     written.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;

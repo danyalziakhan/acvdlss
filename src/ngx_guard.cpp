@@ -15,8 +15,7 @@
 
 namespace
 {
-// Opened for reading with no sharing: until the handle is closed, nobody in
-// the process can open or load the file, however they go about it.
+// No sharing: nothing else can open or load the file until the handle closes.
 HANDLE hold(const std::filesystem::path &path)
 {
     return CreateFileW(path.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -53,13 +52,13 @@ ngx_guard::ngx_guard(const std::wstring &game_folder)
 
     hold_dlss5_in(game_folder);
 
-    // What NVIDIA's driver ships in its own folder, in case a driver does.
+    // In case a driver ships DLSS 5 in its own folder.
     const std::filesystem::path repository = known_folder(FOLDERID_System) / L"DriverStore" / L"FileRepository";
     for (const auto &entry : std::filesystem::directory_iterator(repository, error))
         if (entry.is_directory(error) && entry.path().filename().wstring().rfind(L"nv_dispi.inf", 0) == 0)
             hold_dlss5_in(entry.path() / L"ngx-builtins");
 
-    // The copies NVIDIA's driver downloads.
+    // Copies downloaded by the driver.
     const std::filesystem::path models = known_folder(FOLDERID_ProgramData) / L"NVIDIA" / L"NGX" / L"models" / L"dlssnr";
     for (const auto &entry : std::filesystem::recursive_directory_iterator(
              models, std::filesystem::directory_options::skip_permission_denied, error))

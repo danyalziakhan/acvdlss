@@ -11,12 +11,11 @@
 //   8B 8C 8A <table RVA>    mov ecx, [rdx + rcx*4 + table]
 //   48 03 CA FF E1          add rcx, rdx ; jmp rcx
 //
-// Cases 1 to 4 mask the frame number with 3, 7, 15 and 31 and call one
-// generator: 4, 8, 16 and 32 positions. The game always takes case 2. Writing
-// the address of case 3 or 4 into that table entry gives 16 or 32 positions
-// with the game's own code, so the projection, the TAA constants and what we
-// hand DLSS all stay in step. The table sits in the game's code, and nothing
-// is changed unless every case looks exactly as expected.
+// Cases 1 to 4 mask the frame number with 3, 7, 15 and 31 and call the same
+// generator (4, 8, 16 and 32 positions). The game always takes case 2.
+// Pointing that table entry at case 3 or 4 gives 16 or 32 positions from the
+// game's own code, so the projection, the TAA constants and the jitter we pass
+// DLSS stay in sync. Nothing is patched unless every case matches exactly.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -26,6 +25,19 @@
 
 #include "jitter.h"
 #include "acvdlss.h"
+
+#ifdef ACVDLSS_PLAIN
+
+// This build leaves the game's own 8 positions alone.
+void jitter_start() {}
+void jitter_apply(uint32_t, uint32_t) {}
+void jitter_restore() {}
+uint32_t jitter_positions()
+{
+    return 0;
+}
+
+#else
 
 #include <algorithm>
 #include <atomic>
@@ -50,12 +62,12 @@ const uint32_t CASE_SIZE = 10; // and ebx, mask ; mov ecx, ebx ; call
 
 std::atomic<uint32_t *> g_entry{nullptr};         // the table entry the game takes
 uint32_t g_case8 = 0, g_case16 = 0, g_case32 = 0; // RVAs of the three cases
-// The render thread changes the sequence and the present thread gives the game
-// its own back; both change the page's protection, so one at a time.
+// The render thread and the present thread both write the entry and change
+// the page's protection.
 std::mutex g_write_lock;
 uint32_t g_positions = 0; // under g_write_lock
 
-// Readable code pages only: PAGE_EXECUTE alone cannot be read.
+// PAGE_EXECUTE alone isn't readable.
 bool readable_code(DWORD protect)
 {
     return (protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0 &&
@@ -122,8 +134,8 @@ void find()
         return;
     }
 
-    // The lea must point at the image base, and the table must lie inside it,
-    // with its entries aligned for the single store that changes one.
+    // The lea must load the image base, and the table must be inside the image
+    // and 4-byte aligned so one store can swap an entry.
     int32_t lea;
     memcpy(&lea, found + LEA_AT + 3, 4);
     uint32_t table_rva;
@@ -154,8 +166,8 @@ void find()
     acv_log(reshade::log::level::info, text);
 }
 
-// The scan runs on a thread of its own, which holds a reference to this module
-// so the add-on cannot be unloaded under it.
+// The thread holds a reference to this module so the add-on can't be unloaded
+// mid-scan.
 DWORD WINAPI find_thread(void *module)
 {
     find();
@@ -178,7 +190,7 @@ void write_case(uint32_t positions)
                 "jitter: could not make the game's jump table writable; the game keeps its positions");
         return;
     }
-    // One aligned 4-byte store: the game's threads see the old case or the new one.
+    // Aligned 4-byte store, so game threads see either the old case or the new.
     reinterpret_cast<std::atomic<uint32_t> *>(entry)->store(target);
     VirtualProtect(entry, sizeof(*entry), old, &old);
     g_positions = positions;
@@ -202,10 +214,14 @@ void jitter_start()
 
 void jitter_apply(uint32_t render_width, uint32_t output_width)
 {
-    // A frame already under way when DLSS was switched off must not undo the
-    // restore that came with it.
+    // A frame in flight when DLSS was switched off must not undo the restore.
     if (g_entry.load() == nullptr || render_width == 0 || !g_settings.enabled)
         return;
+    if (const uint32_t forced = g_settings.jitter_positions; forced != 0)
+    {
+        write_case(forced);
+        return;
+    }
     const double scale = double(output_width) / double(render_width);
     const double wanted = 8.0 * scale * scale;
     write_case(wanted <= 8.0 + 1e-3 ? 8 : wanted <= 16.0 + 1e-3 ? 16 : 32);
@@ -223,3 +239,5 @@ uint32_t jitter_positions()
     std::lock_guard lock(g_write_lock);
     return g_positions;
 }
+
+#endif
