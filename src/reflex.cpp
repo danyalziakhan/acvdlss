@@ -276,15 +276,14 @@ void report()
     g_sleeps = 0;
 }
 
-// Reflex stays off while a frame generation tool is in use. With Reflex on,
-// the GPU hung (every time with FSR frame generation, once with DLSS frame
-// generation), and the tool does its own latency handling anyway, so ours
-// gained nothing measurable.
+// Reflex stays off with FSR or XeSS frame generation. With FSR's swapchain
+// and Reflex on, the GPU hung every time. XeSS runs Intel's own latency
+// handling, so ours gains nothing there. DLSS frame generation keeps it:
+// Streamline takes our markers and was stable in every test.
 //
 // OptiScaler loads every frame generation library up front, so check its
-// FGOutput setting instead (changes only apply after a restart). Without
-// OptiScaler, a loaded AMD library counts as in use. Streamline doesn't,
-// because RenoDX DLSS loads it for its own use.
+// FGOutput setting instead. Changes to it only apply after a restart. Without
+// OptiScaler, a loaded AMD library counts as in use.
 bool frame_generation_in_use()
 {
     static const int configured = [] {
@@ -293,7 +292,7 @@ bool frame_generation_in_use()
             return -1;
         wchar_t value[32] = L"";
         GetPrivateProfileStringW(L"FrameGen", L"FGOutput", L"", value, 32, ini.c_str());
-        return value[0] != L'\0' && _wcsicmp(value, L"nofg") != 0 && _wcsicmp(value, L"auto") != 0 ? 1 : 0;
+        return _wcsicmp(value, L"fsrfg") == 0 || _wcsicmp(value, L"xefg") == 0 ? 1 : 0;
     }();
     if (configured >= 0)
         return configured == 1;
@@ -309,7 +308,7 @@ bool step_aside()
     {
         const bool now = frame_generation_in_use();
         if (now && !aside)
-            log_text("Reflex: off while a frame generation tool is in use");
+            log_text("Reflex: off while FSR or XeSS frame generation is in use");
         aside = now;
     }
     return aside;
@@ -435,7 +434,6 @@ const char *reflex_unavailable()
     if (g_load == load_state::failed)
         return "Needs an NVIDIA graphics card.";
     if (frame_generation_in_use())
-        return "Off while a frame generation tool is in use.\n"
-               "The tool manages latency on its own.";
+        return "Off while FSR or XeSS frame generation is in use.";
     return nullptr;
 }

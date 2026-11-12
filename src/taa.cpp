@@ -91,7 +91,7 @@ bool same(const texture_entry &e, format fmt, uint32_t width, uint32_t height)
 // Seven same-size textures: color, motion, depth (R32F), mask (R8), color,
 // mask, color. Color is RGBA8, or RGBA16F with HDR. Slot 1 is always RGBA8.
 // Dialogue cutscenes bind a 4x4 placeholder in slot 1 and leave slot 6 empty,
-// so both are allowed. Minimum width 480 (25% scale at 1920 wide); formats and
+// so both are allowed. Minimum width 480 (25% scale at 1920 wide). Formats and
 // sizes are what identify the pass.
 int match_taa(const texture_entry *e, size_t n)
 {
@@ -327,8 +327,8 @@ void debug_event(const char *format, ...)
 
 //----------------------------------------------------------------------------
 // Debug only: the add-on's own CPU time per handler. Camera movement makes the
-// game bind more tables and stream more textures, all of which go through
-// these handlers, so this separates our cost from the game's.
+// game bind more tables and stream more textures through these handlers. This
+// separates our cost from the game's.
 
 enum probe : size_t
 {
@@ -681,9 +681,9 @@ std::string describe(const texture_entry &e)
 }
 
 // Tables with a frame-size depth texture and enough slots to be the TAA that
-// didn't match, each noted once. Logged immediately with Debug on; otherwise
-// the first few are kept for the "TAA pass never found" log note, which is
-// what a "waiting for the game's anti-aliasing" report needs.
+// didn't match, each noted once. Logged immediately with Debug on. Otherwise
+// the first few are kept for the "TAA pass never found" log note, for
+// "waiting for the game's anti-aliasing" reports.
 std::mutex g_near_miss_lock;
 std::unordered_set<uint64_t> g_near_miss_seen;
 std::vector<std::string> g_near_misses;
@@ -975,9 +975,9 @@ struct redirect_site
 };
 
 // How long to search for passes reading the frame after its size or texture
-// changes. Found passes stay known. There can be several: with FSR on, a pass
-// that reads last frame's TAA output into something screen-sized was found
-// before the real screen pass (which at 100% read FSR 1's output instead).
+// changes. Found passes stay known. There can be several. With FSR on, a pass
+// reading last frame's TAA output into something screen-sized was found
+// before the real screen pass, which at 100% read FSR 1's output instead.
 const uint64_t DISCOVERY_FRAMES = 120;
 const size_t MAX_SITES = 4;
 
@@ -1176,12 +1176,12 @@ void apply_redirect(command_list *cmd, list_state &st)
 }
 
 // With FSR on in the game, FSR 1 runs in compute between the TAA and the
-// screen pass: EASU upscales the TAA output to the resolution scale's size and
-// RCAS sharpens it into another texture, which the screen pass stretches to the
-// screen. We skip EASU and RCAS and redirect the screen pass away from their
-// outputs too, so DLSS goes from render size to screen in one step without the
-// game's sharpening on top. The DLSS frame is still resampled into each skipped
-// output so nothing reads an unwritten texture.
+// screen pass. EASU upscales the TAA output to the resolution scale's size,
+// RCAS sharpens it into another texture, and the screen pass stretches that to
+// the screen. We skip EASU and RCAS and redirect the screen pass away from
+// their outputs too, so DLSS goes from render size to screen in one step,
+// without the game's sharpening. The DLSS frame is still resampled into each
+// skipped output so nothing reads an unwritten texture.
 void check_delivery(command_list *cmd, list_state &st, uint32_t param, descriptor_table table)
 {
     if (!g_upscale_active)
@@ -1252,7 +1252,7 @@ bool deliver(command_list *cmd, list_state &st)
         if (!in_fsr_chain(g_upscale, d.target.handle))
             g_upscale.fsr_chain[g_upscale.fsr_chain_next++ % std::size(g_upscale.fsr_chain)] = d.target.handle;
         // The game cycles through more outputs than the chain holds, so new
-        // textures are routine. Only a new site reopens discovery; known sites
+        // textures are routine. Only a new site reopens discovery. Known sites
         // already compare against the newest textures.
         if (d.new_site)
         {
@@ -1263,8 +1263,8 @@ bool deliver(command_list *cmd, list_state &st)
         }
     }
 
-    // Written even when the screen pass gets redirected, so any pass that
-    // isn't (or isn't yet) reads a real image instead of stale contents.
+    // Written even when the screen pass gets redirected, so a pass that isn't
+    // redirected yet reads a real image instead of stale contents.
     context &c = *g_ctx;
     device *dev = cmd->get_device();
     const resource_desc desc = dev->get_resource_desc(d.target);
@@ -1606,7 +1606,7 @@ table_layout describe_table(uint32_t count, const Range *ranges)
         const descriptor_range &range = ranges[r];
         if (range.type == descriptor_type::constant_buffer && (t.first_cbv < 0 || int32_t(range.binding) < t.first_cbv))
             t.first_cbv = int32_t(range.binding);
-        // Unbounded ranges report UINT32_MAX; only the first slots are used.
+        // Unbounded ranges report UINT32_MAX. Only the first slots are used.
         const uint32_t slots = std::min<uint32_t>(range.count, MAX_TABLE_TEXTURES);
         std::vector<uint32_t> *into = range.type == descriptor_type::shader_resource_view    ? &t.textures
                                       : range.type == descriptor_type::unordered_access_view ? &t.writes
@@ -1771,7 +1771,7 @@ void on_push_descriptors(command_list *cmd, shader_stage stages, pipeline_layout
     {
     case descriptor_type::constant_buffer:
     {
-        // ReShade passes buffer + offset; D3D12 wants the GPU address.
+        // ReShade passes buffer + offset. D3D12 wants the GPU address.
         const auto &range = *static_cast<const buffer_range *>(update.descriptors);
         auto *buffer = reinterpret_cast<ID3D12Resource *>(range.buffer.handle);
         v.kind = root_kind::cbv;
@@ -2062,8 +2062,8 @@ void summarize_frames()
 }
 
 // Every frame, Debug or not: checks for a lost device and a TAA pass that
-// never shows up. Cheap, and exactly what crash and "waiting for the game's
-// anti-aliasing" reports need.
+// never shows up. Cheap, and needed for crash and "waiting for the game's
+// anti-aliasing" reports.
 void check_device(context &c)
 {
     // Catches a driver crash or TDR before anything else does.
@@ -2175,7 +2175,7 @@ void taa_unregister()
 // Whether this frame counts toward a pipeline cache rebuild. Normally only
 // frames where DLSS replaced the TAA (actual gameplay). When DLSS is off,
 // can't run or never finds the TAA (Anti-aliasing not on High), menus can't be
-// told from play, so every frame counts; otherwise the cache would be rebuilt
+// told from play, so every frame counts. Otherwise the cache would be rebuilt
 // at every start.
 static bool present_frame(command_queue *queue, uint32_t display_width, uint32_t display_height)
 {

@@ -61,10 +61,10 @@ void main(uint3 id : SV_DispatchThreadID)
     float2 uv = (float2(p) + 0.5) * size.zw;
     bool sky = d >= depth_params.x;
 
-    // Sky pixels, and all pixels in dialogue cutscenes (the game binds a 4x4
-    // placeholder instead of motion vectors), get camera motion. No jitter
-    // term: tested +1, 0, -1 and +2 times the jitter delta, and only 0 keeps
-    // the clouds still.
+    // Sky pixels get camera motion, and so does everything in dialogue
+    // cutscenes, where the game binds a 4x4 placeholder instead of motion
+    // vectors. No jitter term: of +1, 0, -1 and +2 times the jitter delta,
+    // only 0 keeps the clouds still.
     float2 motion;
     if (sky || flags.x == 0.0)
     {

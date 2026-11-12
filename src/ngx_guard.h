@@ -5,9 +5,9 @@
 
 // Keeps DLSS 5 (neural rendering) out of our NGX startup. NGX loads every DLSS
 // feature it finds on init, so a signed nvngx_dlssnr.dll got set up with our
-// device first, and RenoDX DLSS running neural rendering later crashed inside
-// ReShade (RTX 50, official DLLs). We only need super resolution, so we hold
-// the DLSS 5 files open without sharing during our startup. NGX then skips
+// device first. RenoDX DLSS then crashed inside ReShade when it ran neural
+// rendering (RTX 50, official DLLs). We only need super resolution, so the
+// DLSS 5 files are held open without sharing during our startup. NGX skips
 // them as it would an unsigned DLL, and RenoDX DLSS loads them afterwards.
 class ngx_guard
 {

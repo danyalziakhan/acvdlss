@@ -21,7 +21,7 @@
 #include <optional>
 #include <string>
 
-// Any stable GUID works as a project ID for NGX; this one is ours.
+// NGX accepts any stable GUID as a project ID.
 static const char *PROJECT_ID = "5c3f9a1e-7b2d-4e8a-9f61-0d4c2b7e3a95";
 
 // Lets a report tell an official nvngx_dlssnr.dll from a modified one, since
@@ -110,7 +110,7 @@ bool dlss::init(ID3D12Device *device, bool log)
     _device = device;
     const std::wstring folder = game_folder();
     log_versions(folder);
-    // NGX looks next to the exe on its own; naming the folder also covers
+    // NGX looks next to the exe on its own. Naming the folder also covers
     // launchers that start the game from somewhere else.
     const wchar_t *paths[] = {folder.c_str()};
     NVSDK_NGX_FeatureCommonInfo info = {};
@@ -186,8 +186,8 @@ void dlss::release_feature()
     _feature = nullptr;
 }
 
-// DLSS takes the exact render size whatever the mode; the mode only picks the
-// tuning, so the nearest one to the game's resolution scale is used.
+// DLSS takes the exact render size whatever the mode. The mode only picks the
+// tuning, so use the one nearest the game's resolution scale.
 static NVSDK_NGX_PerfQuality_Value quality_for(const dlss_frame &frame)
 {
     const float scale = float(frame.width) / float(frame.output_width);
@@ -204,8 +204,8 @@ static NVSDK_NGX_PerfQuality_Value quality_for(const dlss_frame &frame)
 
 bool dlss::create(ID3D12GraphicsCommandList *list, const dlss_frame &frame)
 {
-    // The preset is a hint per quality mode; the same one goes to all of them
-    // so it holds whichever mode the resolution scale picks.
+    // The preset is a hint per quality mode. Set it on all of them so it holds
+    // whichever mode the resolution scale picks.
     const char *hints[] = {
         NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA,
         NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality,
@@ -282,7 +282,7 @@ bool dlss::evaluate(ID3D12GraphicsCommandList *list, const dlss_frame &frame)
     eval.InJitterOffsetY = frame.jitter_y;
     eval.InRenderSubrectDimensions = {frame.width, frame.height};
     eval.InReset = frame.reset || changed ? 1 : 0;
-    // Motion vectors are in UV units; DLSS wants pixels.
+    // Motion vectors are in UV units. DLSS wants pixels.
     eval.InMVScaleX = float(frame.width);
     eval.InMVScaleY = float(frame.height);
     eval.InFrameTimeDeltaInMsec = frame.frame_ms;

@@ -16,8 +16,8 @@ namespace reshade::api
     struct command_queue;
 }
 
-// Logs to acvdlss.log next to the game's exe; warnings and errors also to
-// ReShade's log, where they get an "ACV DLSS: " in front.
+// Logs to acvdlss.log next to the game's exe. Warnings and errors also go to
+// ReShade's log, prefixed with "ACV DLSS: ".
 void acv_log(reshade::log::level level, const char *message);
 // The folder of the game's exe.
 std::wstring game_folder();
@@ -35,12 +35,12 @@ struct settings
     std::atomic<bool> enabled{true};
     std::atomic<uint32_t> preset{0}; // NVIDIA's value: 0 lets DLSS choose, 1..13 are A..M
     std::atomic<float> sharpness{0.0f}; // 0..1, 0 skips RCAS
-    std::atomic<uint32_t> reflex{0};    // reflex_mode
+    std::atomic<uint32_t> reflex{1};    // reflex_mode
     // Only in acvdlss.ini: 0 picks from the upscaling ratio, else 8, 16 or 32.
     std::atomic<uint32_t> jitter_positions{0};
-    // Only in ReShade.ini: detailed logging, every frame if need be.
+    // Only in acvdlss.ini: detailed logging, every frame if need be.
     std::atomic<bool> debug{false};
-    // Only in ReShade.ini: give frame generation tools the image without the
+    // Only in acvdlss.ini: gives frame generation tools the image without the
     // HUD. Turn off if an effect drawn after the TAA looks wrong in generated
     // frames.
     std::atomic<bool> hudless{true};

@@ -69,8 +69,8 @@ rebuilds the cache again.
 1. Install ReShade 6.8 or newer with add-on support.
 2. Download the latest DLSS DLL from
    [TechPowerUp](https://www.techpowerup.com/download/nvidia-dlss-dll/).
-3. Copy `acvdlss.addon64`, `acvdlss.ini` and `nvngx_dlss.dll` next to
-   `ACValhalla.exe`, where ReShade's DLL is.
+3. Copy `acvdlss.addon64` and `nvngx_dlss.dll` next to `ACValhalla.exe`,
+   where ReShade's DLL is.
 4. Set **Anti-aliasing** to **High** in the game's graphics options.
 5. Start the game. The first start after installing or updating is slow while
    the game rebuilds its pipeline cache. Play for 3 minutes with DLSS on after
@@ -100,8 +100,8 @@ what DLSS is doing right now, and the LOD bias when FSR is on.
 - **Sharpness** applies AMD's RCAS to the DLSS image before the HUD is drawn.
 - **NVIDIA Reflex** is experimental, see below.
 
-All settings are saved in `acvdlss.ini` next to `ACValhalla.exe`. These can
-only be changed there:
+All settings are saved in `acvdlss.ini` next to `ACValhalla.exe`, which is
+created on the first start. These can only be changed there:
 
 - `HudlessImage` under `[OptiScaler]`, see the frame generation section.
 - `JitterPositions` under `[Advanced]`: `Auto`, or force 8, 16 or 32 camera
@@ -110,15 +110,18 @@ only be changed there:
 
 ## NVIDIA Reflex (experimental)
 
-Reflex is a work in progress and off by default.
+Reflex is still experimental. It's on by default.
 
 - **On** keeps frames from queueing up for the graphics card, so your input
   reaches the screen sooner. In testing, GPU bound at about 35 fps, it cut
   input latency by about a third, with no loss in frame rate.
 - **On + Boost** also keeps the graphics card's clocks up when the CPU is the
   limit. It makes no difference while the graphics card is the limit.
+- With OptiScaler's DLSS frame generation it stays on and gives frame
+  generation the game's frame timing. It felt noticeably more responsive in
+  testing.
 - It's switched off by itself, with the option greyed out, while OptiScaler's
-  frame generation is in use. See the next section.
+  FSR or XeSS frame generation is in use. See the next section.
 - It overrides frame rate caps that work through Reflex, like RTSS in Reflex
   mode or the NVIDIA App's Max Frame Rate. Use the game's own frame limit
   instead.
@@ -146,9 +149,12 @@ Things to know:
 - **No HUD fix needed.** ACV DLSS hands OptiScaler the picture before the HUD
   is drawn, so the HUD stays sharp in generated frames with OptiScaler's
   **HUDFix** off.
-- **Reflex is switched off** while `FGOutput` is set to a frame generation
-  output. Together with frame generation it hung the GPU in testing, and
-  OptiScaler handles latency on its own anyway.
+- **Reflex with DLSS frame generation** (`dlssg`) stays on and was stable in
+  testing. OptiScaler's **FPS Limit** then caps the frames you see, so for 30
+  real frames doubled to 60, set it to 60.
+- **Reflex is switched off** while `FGOutput` is `fsrfg` or `xefg`. With FSR
+  frame generation it hung the GPU in testing, and XeSS frame generation runs
+  Intel's own latency handling.
 - **Recommended: switch frame generation off before loading screens.** Loading
   a save or fast travelling with it on has frozen the game in testing. Press
   **End** before, and turn it back on once you're in.
@@ -162,9 +168,9 @@ Things to know:
 
 How the outputs behaved in testing:
 
-- **DLSS frame generation** (`dlssg`): smooth, with NVIDIA's own latency
-  handling while it's on. Needs an RTX 40 or 50 card, or a community
-  replacement DLL on older cards, like `dlssg_for_sm86` for RTX 30.
+- **DLSS frame generation** (`dlssg`): smooth, with Reflex from ACV DLSS.
+  Needs an RTX 40 or 50 card, or a community replacement DLL on older cards,
+  like `dlssg_for_sm86` for RTX 30.
 - **FSR frame generation** (`fsrfg`): runs on any RTX card.
 - **XeSS frame generation** (`xefg`): runs on any RTX card, with Intel's
   latency handling on the whole time.

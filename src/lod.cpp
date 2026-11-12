@@ -4,21 +4,21 @@
 // FSR's smaller render size inside it. Asking for more detail reads mips that
 // aren't loaded, and ground pages baked from them turn black up close. So the
 // bias is log2(FSR render size / resolution scale size): 0 with FSR off, -1
-// with FSR Performance. NVIDIA's guide adds another -1, which is exactly what
-// read past the loaded mips here, at any resolution.
+// with FSR Performance. NVIDIA's guide adds another -1, which read past the
+// loaded mips here at any resolution.
 //
 // Valhalla's texture samplers are static samplers in its root signatures, so
 // there's nothing to swap at bind time. The bias goes in at creation (ReShade
-// raises create_sampler for static samplers too). Two consequences: a new
-// resolution scale needs a restart, and the game's pipeline cache doesn't
-// notice a changed static sampler. Stale pipelines once left interiors without
-// indirect light. So when the bias changes, the cache is cleared before the
-// game opens it and the next start is slow.
+// raises create_sampler for static samplers too). So a new resolution scale
+// needs a restart, and the game's pipeline cache doesn't notice a changed
+// static sampler. Stale pipelines once left interiors without indirect light.
+// When the bias changes, the cache is cleared before the game opens it, and
+// the next start is slow.
 //
 // A rebuild cut short is just as broken (blinking, blotchy shadows, banded
 // sky). The note in the cache says "building" until the session that cleared
-// it has run REBUILD_TIME of gameplay, and a start that still finds "building"
-// clears it again. The note is finished while the game runs because the game
+// it has run REBUILD_TIME of gameplay. A start that still finds "building"
+// clears it again. The note is finished while the game runs, since the game
 // exits without unloading the add-on.
 //
 // Later damage can't be detected. The game writes most of its cache after the

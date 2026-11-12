@@ -9,10 +9,10 @@
 
 // Tracks what the game writes into each descriptor heap slot (SRV/UAV views,
 // CBV buffer ranges) so bound tables can be read back. The game writes
-// thousands of descriptors a frame from several threads, so slots live in
-// fixed chunks indexed by shift and mask with no lock, and copies go a chunk
-// run at a time. Same answers as ReShade's descriptor_tracking example for
-// views and buffers; samplers and pipeline layouts aren't tracked.
+// thousands of descriptors a frame from several threads. Slots live in fixed
+// chunks indexed by shift and mask with no lock, and copies go a chunk run at
+// a time. Same answers as ReShade's descriptor_tracking example for views and
+// buffers. Samplers and pipeline layouts aren't tracked.
 class __declspec(uuid("6a0e3c94-58d1-4f7b-a2c6-0b9e7d51f3a8")) descriptor_tracker
 {
 public:
@@ -41,7 +41,7 @@ private:
 
     static const uint32_t CHUNK_BITS = 12;
     static const uint32_t CHUNK = 1u << CHUNK_BITS;
-    // D3D12 allows a million descriptors in a shader-visible heap; this covers
+    // D3D12 allows a million descriptors in a shader-visible heap. This covers
     // twice that.
     static const uint32_t MAX_CHUNKS = 512;
 

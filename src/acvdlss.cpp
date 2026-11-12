@@ -1,8 +1,8 @@
 // ACV DLSS
 //
 // Replaces Assassin's Creed Valhalla's TAA with NVIDIA DLSS. taa.cpp finds the
-// pass and runs DLSS; this file is the add-on around it: settings, the toggle
-// key and the ACV DLSS window in the ReShade overlay.
+// pass and runs DLSS. This file has the settings, the toggle key and the
+// ACV DLSS window in the ReShade overlay.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -37,8 +37,8 @@ settings g_settings;
 static effect_runtime *g_runtime = nullptr;
 static bool g_overlay_open = false;
 
-// NVIDIA's preset numbers are the index. Letters the current runtime no longer
-// has still go through; DLSS treats them as Auto, and the label says so.
+// NVIDIA's preset numbers are the index. Letters the current runtime dropped
+// still go through. DLSS treats them as Auto, and the label says so.
 static const char *PRESETS[] = {
     "Auto",
     "A (removed, acts as Auto)",
@@ -94,7 +94,7 @@ static void load_settings()
     g_settings.enabled = config_int("General", "Enabled", 1) != 0;
     g_settings.preset = read_preset();
     g_settings.sharpness = float(std::clamp(config_int("DLSS", "Sharpness", 0), 0, 100)) / 100.0f;
-    g_settings.reflex = uint32_t(std::clamp(config_int("Latency", "Reflex", 0), 0, 2));
+    g_settings.reflex = uint32_t(std::clamp(config_int("Latency", "Reflex", 1), 0, 2));
     g_settings.hudless = config_int("OptiScaler", "HudlessImage", 1) != 0;
     const int positions = config_int("Advanced", "JitterPositions", 0); // Auto reads as 0
     g_settings.jitter_positions = positions == 8 || positions == 16 || positions == 32 ? uint32_t(positions) : 0;
