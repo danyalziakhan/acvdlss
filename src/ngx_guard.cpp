@@ -58,7 +58,7 @@ ngx_guard::ngx_guard(const std::wstring &game_folder)
         if (entry.is_directory(error) && entry.path().filename().wstring().rfind(L"nv_dispi.inf", 0) == 0)
             hold_dlss5_in(entry.path() / L"ngx-builtins");
 
-    // Copies downloaded by the driver.
+    // Downloaded by the driver.
     const std::filesystem::path models = known_folder(FOLDERID_ProgramData) / L"NVIDIA" / L"NGX" / L"models" / L"dlssnr";
     for (const auto &entry : std::filesystem::recursive_directory_iterator(
              models, std::filesystem::directory_options::skip_permission_denied, error))
@@ -70,8 +70,8 @@ ngx_guard::ngx_guard(const std::wstring &game_folder)
     {
         char text[160];
         snprintf(text, sizeof(text),
-                 "kept %zu DLSS 5 (neural rendering) file%s out of ACV DLSS's own DLSS start-up, on purpose; RenoDX "
-                 "DLSS still loads DLSS 5 for itself",
+                 "kept %zu DLSS 5 (neural rendering) file%s out of ACV DLSS's own DLSS start-up, on purpose; other "
+                 "add-ons still load DLSS 5 for themselves",
                  _held.size(), _held.size() == 1 ? "" : "s");
         acv_log(reshade::log::level::info, text);
     }

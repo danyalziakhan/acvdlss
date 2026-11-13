@@ -1,11 +1,9 @@
 // RCAS from AMD FidelityFX Super Resolution 1, MIT license (see the README).
-// Sharpens as much as possible without overshooting the five-tap neighborhood,
-// and backs off where luma looks like noise.
 
 cbuffer constants : register(b0)
 {
     float sharpness; // scales the lobe, 0 to 1
-    float hdr;       // 1 when the image is scene referred and needs mapping into 0..1 first
+    float hdr;       // 1 for scene referred
     float2 unused;
 };
 

@@ -1,6 +1,5 @@
-// Converts Valhalla's TAA inputs for DLSS: a color copy, UV-space motion
-// vectors pointing to the previous frame, and device depth. Color is copied
-// because the game leaves its textures in a pixel-shader-only state.
+// Converts the TAA inputs for DLSS. Color is copied because the game leaves
+// its textures in a pixel-shader-only state.
 
 cbuffer constants : register(b0)
 {
@@ -29,10 +28,8 @@ float unpack_motion(uint q)
     return sign(v) * 0.2 * v2 * v2;
 }
 
-// Previous-frame UV assuming only the camera moved. The game's inverse
-// projection is only valid at the far plane, so we unproject there and scale
-// along the ray to the pixel's depth. Sky stays at the far plane, as in the
-// game's TAA.
+// Camera motion only. The game's inverse projection is only valid at the far
+// plane, so unproject there and scale along the ray to the pixel's depth.
 float2 reproject(float2 uv, float view_depth, bool sky)
 {
     float4 clip = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth_params.w, 1.0);
@@ -61,10 +58,9 @@ void main(uint3 id : SV_DispatchThreadID)
     float2 uv = (float2(p) + 0.5) * size.zw;
     bool sky = d >= depth_params.x;
 
-    // Sky pixels get camera motion, and so does everything in dialogue
-    // cutscenes, where the game binds a 4x4 placeholder instead of motion
-    // vectors. No jitter term: of +1, 0, -1 and +2 times the jitter delta,
-    // only 0 keeps the clouds still.
+    // Dialogue cutscenes bind a 4x4 placeholder instead of motion vectors.
+    // No jitter term. Of +1, 0, -1 and +2 times the jitter delta, only 0 kept
+    // the clouds still.
     float2 motion;
     if (sky || flags.x == 0.0)
     {

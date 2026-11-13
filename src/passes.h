@@ -2,10 +2,11 @@
 
 #include <d3d12.h>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
-// Root constants of prepare.hlsl, in the order its cbuffer declares them.
+// Must match the cbuffer order in prepare.hlsl.
 struct prepare_constants
 {
     float size[4];
@@ -17,42 +18,66 @@ struct prepare_constants
 };
 static_assert(sizeof(prepare_constants) == 52 * 4, "prepare.hlsl expects 52 root constants");
 
+// The game's constants for each effect.
+struct radial_constants
+{
+    float c0[4], c1[4], c2[4], c3[4];
+};
+
+struct lens_constants
+{
+    float c1[4], c2[4], c3[4];
+};
+
+// Redone on DLSS's output.
+struct screen_fx
+{
+    float vignette = 0.0f; // 0 for none
+    std::optional<radial_constants> radial;
+    std::optional<lens_constants> lens;
+
+    bool any() const { return vignette > 0.0f || radial || lens; }
+};
+
+// Must match the cbuffer order in screen_effects.hlsl.
+struct screen_effect_constants
+{
+    float size[4];
+    float flags[4];
+    radial_constants radial;
+    lens_constants lens;
+};
+static_assert(sizeof(screen_effect_constants) <= sizeof(prepare_constants), "too many root constants");
+
 struct game_texture
 {
     ID3D12Resource *resource = nullptr;
-    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN; // the format the game reads it with
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN; // as the game reads it
 };
 
-// The compute passes around DLSS and the textures they share. Everything is
-// recorded with plain D3D12 into the game's command list.
+// Compute passes around DLSS, recorded with plain D3D12 into the game's list.
 class passes
 {
 public:
     bool init(ID3D12Device *device);
     void shutdown();
 
-    // Recreates the work textures when a size or the color format changes. Old
-    // ones are kept until `frame` is far enough behind.
+    // Old textures are kept until `frame` is far enough behind.
     bool resize(uint32_t width, uint32_t height, uint32_t output_width, uint32_t output_height,
                 DXGI_FORMAT color_format, uint64_t frame);
     void collect(uint64_t frame);
 
-    // Fills color, motion and depth and leaves them readable by DLSS.
     void prepare(ID3D12GraphicsCommandList *list, const game_texture &color, const game_texture &motion,
                  const game_texture &depth, const prepare_constants &constants);
 
-    // Optionally sharpens, then copies the result into the game's TAA target.
-    // When upscaling, the full-size result goes to presented() for the pass
-    // that scales to the screen, and a downsampled copy to the TAA target for
-    // everything else. Leaves the work textures in the state prepare() expects.
-    void finish(ID3D12GraphicsCommandList *list, float sharpness, bool hdr, ID3D12Resource *taa_target);
-    // Returns the inputs to the UAV state prepare() expects. Called by finish(),
-    // and on its own when DLSS didn't run.
+    // When upscaling, the full-size result goes to presented() and a
+    // downsampled copy to the TAA target for everything else.
+    void finish(ID3D12GraphicsCommandList *list, float sharpness, bool hdr, const screen_fx &fx,
+                ID3D12Resource *taa_target);
+    // For when DLSS didn't run. finish() calls it too.
     void abandon(ID3D12GraphicsCommandList *list);
 
-    // Resamples presented() into a game texture (in UAV state) at its size and
-    // format. This is how the frame reaches the screen when the game's FSR 1
-    // upscales.
+    // Fills an FSR 1 output, which must be in UAV state.
     void deliver(ID3D12GraphicsCommandList *list, ID3D12Resource *target, DXGI_FORMAT format, uint32_t width,
                  uint32_t height);
 
@@ -62,11 +87,10 @@ public:
     ID3D12Resource *motion() const { return _motion; }
     ID3D12Resource *depth() const { return _depth; }
     ID3D12Resource *output() const { return _output; }
-    // The upscaled frame. Readable by any shader between frames.
+    // Readable by any shader between frames.
     ID3D12Resource *presented() const { return _presented; }
-    // The image finish() produced for this sharpness, and its state after the
-    // frame's passes.
-    ID3D12Resource *screen_image(float sharpness, uint32_t &state) const;
+    // What finish() produced, and its state afterward.
+    ID3D12Resource *screen_image(float sharpness, const screen_fx &fx, uint32_t &state) const;
     DXGI_FORMAT color_format() const { return _color_format; }
     const std::string &error() const { return _error; }
 
@@ -86,6 +110,7 @@ private:
     ID3D12PipelineState *_prepare = nullptr;
     ID3D12PipelineState *_rcas = nullptr;
     ID3D12PipelineState *_downsample = nullptr;
+    ID3D12PipelineState *_screen_effects = nullptr;
     ID3D12DescriptorHeap *_heap = nullptr;
     uint32_t _increment = 0;
     uint32_t _next_slot = 0;

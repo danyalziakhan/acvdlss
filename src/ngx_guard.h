@@ -3,12 +3,10 @@
 #include <string>
 #include <vector>
 
-// Keeps DLSS 5 (neural rendering) out of our NGX startup. NGX loads every DLSS
-// feature it finds on init, so a signed nvngx_dlssnr.dll got set up with our
-// device first. RenoDX DLSS then crashed inside ReShade when it ran neural
-// rendering (RTX 50, official DLLs). We only need super resolution, so the
-// DLSS 5 files are held open without sharing during our startup. NGX skips
-// them as it would an unsigned DLL, and RenoDX DLSS loads them afterwards.
+// Keeps DLSS 5 out of our NGX startup. NGX sets up every feature it finds on
+// init, and a DLSS 5 already set up on our device crashed the next user of it
+// inside ReShade (RTX 50, official DLLs). Held open without sharing, the files
+// get skipped like an unsigned DLL.
 class ngx_guard
 {
 public:

@@ -23,8 +23,7 @@ std::wstring wide(const char *text)
     return out;
 }
 
-// Earlier versions kept settings in ReShade.ini's [ACVDLSS] section. Move
-// them over once and delete the old keys.
+// Earlier versions kept settings in ReShade.ini's [ACVDLSS] section.
 void take_over_reshade_ini()
 {
     static const struct
@@ -54,7 +53,7 @@ void take_over_reshade_ini()
 void config_open()
 {
     g_path = game_folder() + L"\\acvdlss.ini";
-    // Normally shipped in the zip; write the defaults if it's missing.
+    // Normally shipped in the zip.
     if (GetFileAttributesW(g_path.c_str()) == INVALID_FILE_ATTRIBUTES)
     {
         if (FILE *file = _wfopen(g_path.c_str(), L"wb"))
@@ -63,7 +62,6 @@ void config_open()
             fclose(file);
         }
     }
-    // Old settings in ReShade.ini override the file's, once.
     take_over_reshade_ini();
 }
 

@@ -17,10 +17,9 @@ struct dlss_frame
     uint32_t output_width = 0, output_height = 0; // what DLSS makes of it
     float jitter_x = 0.0f, jitter_y = 0.0f;
     float frame_ms = 0.0f;
-    // The game's camera, only passed along for frame generation tools.
+    // Only for frame generation tools.
     float camera_near = 0.1f, camera_far = 10000.0f, camera_fov = 1.0f; // fov: vertical, radians
-    // The final image before the HUD is drawn on it, and its resource state at
-    // Present. Also only for frame generation tools.
+    // Image before the HUD and its state at Present. Also for frame generation.
     ID3D12Resource *hudless = nullptr;
     uint32_t hudless_state = 0;
     bool hdr = false;
@@ -28,8 +27,7 @@ struct dlss_frame
     uint32_t preset = 0;
 };
 
-// One DLSS feature on one device (DLAA when the sizes match). Creation and
-// evaluation both record into the game's command list.
+// Creation and evaluation both record into the game's command list.
 class dlss
 {
 public:
@@ -37,11 +35,10 @@ public:
     bool init(ID3D12Device *device, bool log);
     void shutdown();
 
-    // Rebuilds the feature first if a size, HDR or the preset changed.
+    // Rebuilds first if a size, HDR or the preset changed.
     bool evaluate(ID3D12GraphicsCommandList *list, const dlss_frame &frame);
 
-    // True if evaluate() would release the current feature. The GPU may still
-    // be using it, so the caller waits for idle first.
+    // The GPU may still be using the old feature. Wait for idle first.
     bool will_rebuild(const dlss_frame &frame) const
     {
         return _feature != nullptr &&

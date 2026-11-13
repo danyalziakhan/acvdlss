@@ -14,10 +14,16 @@ recognizes that table when the game binds it, and on the next draw it:
 1. unpacks the motion vectors and converts depth into what DLSS expects
 2. runs DLSS with the jitter and camera from the game's own constant buffers
 3. sharpens the result with RCAS (optional)
-4. copies it into the TAA's own output texture
+4. redraws the game's screen effects on it
+5. copies it into the TAA's own output texture
 
 It skips the game's TAA and everything drawn after that works on the DLSS
 image, including the HUD.
+
+The game draws its vignette, and the raven view's radial blur and lens
+distortion, before the TAA. Fixed to the screen, they would smear in DLSS's
+history when the camera turns. The add-on takes them out of the image DLSS
+reads and draws them on DLSS's output in one pass, with the game's own values.
 
 When DLSS upscales, the add-on has the game's camera cycle through 16 or 32
 sub-pixel positions instead of its usual 8, as NVIDIA recommends for DLSS.
@@ -59,10 +65,6 @@ DLSS picks up a new FSR mode straight away, but the LOD bias needs a restart,
 because the game builds it into its pipelines at start up. The first start after the bias changes is slow while the game rebuilds its
 pipeline cache. Play for 3 minutes with DLSS on after it, or the next start
 rebuilds the cache again.
-
-![The window after switching FSR to Performance, with the new bias waiting for a restart](nexus/1-window-lod-restart.png)
-
-![The window after the restart, with the LOD bias at -1.00](nexus/1-window-lod-bias.png)
 
 ## Installing
 
@@ -120,7 +122,7 @@ Reflex is still experimental. It's on by default.
 - With OptiScaler's DLSS frame generation it stays on and gives frame
   generation the game's frame timing. It felt noticeably more responsive in
   testing.
-- It's switched off by itself, with the option greyed out, while OptiScaler's
+- It's switched off by itself, with the option grayed out, while OptiScaler's
   FSR or XeSS frame generation is in use. See the next section.
 - It overrides frame rate caps that work through Reflex, like RTSS in Reflex
   mode or the NVIDIA App's Max Frame Rate. Use the game's own frame limit

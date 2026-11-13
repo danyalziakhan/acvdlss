@@ -1,15 +1,12 @@
-// NVIDIA Reflex. The game has none, so the add-on calls it as a game would:
+// NVIDIA Reflex. The game has none, so we place the markers:
 //
 //   finish_present   PRESENT_END, then the wait (NvAPI_D3D_Sleep), then the
 //                    next frame's SIMULATION_START
 //   first submission SIMULATION_END and RENDERSUBMIT_START
 //   present          RENDERSUBMIT_END and PRESENT_START
 //
-// The wait belongs at the start of a frame. Placed right before Present, the
-// GPU idles for a whole frame of CPU work every frame.
-//
-// When off, NvAPI isn't even loaded. Switching off after being on tells the
-// driver once, then stops calling.
+// The wait belongs at frame start. Right before Present, the GPU idled for a
+// whole frame of CPU work every frame.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -30,8 +27,7 @@ using namespace reshade::api;
 
 namespace
 {
-// The parts of NVIDIA's nvapi.h (MIT license) Reflex needs. Same packing as
-// the header (8).
+// From NVIDIA's nvapi.h (MIT license). Same packing as the header (8).
 using NvU8 = unsigned char;
 using NvU32 = unsigned long;
 using NvU64 = unsigned long long;
@@ -103,7 +99,7 @@ struct NV_LATENCY_RESULT_PARAMS
     NvU8 rsvd[32];
 };
 
-// The interface IDs from nvapi_interface.h.
+// From nvapi_interface.h.
 constexpr NvU32 ID_INITIALIZE = 0x0150e828;
 constexpr NvU32 ID_SET_SLEEP_MODE = 0xac1ca9e0;
 constexpr NvU32 ID_SLEEP = 0x852cd1d2;
@@ -130,12 +126,12 @@ enum class load_state
 };
 std::atomic<load_state> g_load{load_state::not_tried};
 
-// All of these belong to the present thread, except as noted.
-ID3D12Device *g_device = nullptr; // the device of the swapchain being presented
-std::atomic<ID3D12Device *> g_marking{nullptr}; // read by submitting threads: markers go to this device
+// Present thread only, except as noted.
+ID3D12Device *g_device = nullptr;
+std::atomic<ID3D12Device *> g_marking{nullptr}; // read by submitting threads
 std::atomic<uint64_t> g_frame{1};
-std::atomic<bool> g_submitted{false}; // SIMULATION_END already sent for the current frame
-int g_applied = -1;                   // what the driver was last told; -1: nothing yet
+std::atomic<bool> g_submitted{false}; // SIMULATION_END sent this frame
+int g_applied = -1;                   // last mode sent to the driver, -1 for none
 
 double g_sleep_ms = 0.0; // with Debug on, for the latency line
 uint32_t g_sleeps = 0;
@@ -146,8 +142,7 @@ void log_text(const char *text)
     acv_log(reshade::log::level::info, text);
 }
 
-// The game loads nvapi64.dll itself. Tools that wrap Reflex hook the same
-// entry points, so they see our calls.
+// The game loads nvapi64.dll itself. Not loaded at all while Reflex is off.
 bool load()
 {
     HMODULE nvapi = GetModuleHandleW(L"nvapi64.dll");
@@ -200,11 +195,10 @@ void tell_driver(int mode)
     params.version = version_of(sizeof(params), 1);
     params.bLowLatencyMode = mode != int(reflex_mode::off);
     params.bLowLatencyBoost = mode == int(reflex_mode::boost);
-    // No frame limit. A limiter that goes through Reflex overrides this.
+    // A limiter that goes through Reflex overrides this.
     params.minimumIntervalUs = 0;
-    // Our markers come from around Present, not the game's real frame start,
-    // so the driver must not schedule work around them. Streamline also
-    // defaults this to off.
+    // Our markers sit around Present, not the real frame start. The driver
+    // must not schedule work around them. Streamline also defaults this to off.
     params.bUseMarkersToOptimize = 0;
     const NvAPI_Status status = g_set_sleep_mode(g_device, &params);
     char text[96];
@@ -221,8 +215,7 @@ void tell_driver(int mode)
     g_applied = mode;
 }
 
-// Debug only, every 600 frames: the driver's latency breakdown from frame
-// start to GPU done.
+// Debug only. The driver's latency breakdown, every 600 frames.
 void report()
 {
     if (g_get_latency == nullptr)
@@ -235,8 +228,8 @@ void report()
         log_text("Reflex latency: the driver gave no report");
         return;
     }
-    // Complete frames only. The GPU often starts a frame before its Present,
-    // so "after Present" runs to GPU done, not GPU start.
+    // The GPU often starts a frame before its Present. So "after Present" runs
+    // to GPU done, not GPU start.
     double total = 0, to_present = 0, after_present = 0, gpu_active = 0, frame_time = 0;
     uint32_t count = 0, timed = 0;
     for (const auto &f : result.frameReport)
@@ -262,7 +255,7 @@ void report()
     }
     else
     {
-        // The driver's times are in microseconds.
+        // Driver times are in microseconds.
         const double n = 1000.0 * count;
         const double fps = frame_time > 0.0 ? 1e6 * timed / frame_time : 0.0;
         snprintf(text, sizeof(text),
@@ -276,14 +269,12 @@ void report()
     g_sleeps = 0;
 }
 
-// Reflex stays off with FSR or XeSS frame generation. With FSR's swapchain
-// and Reflex on, the GPU hung every time. XeSS runs Intel's own latency
-// handling, so ours gains nothing there. DLSS frame generation keeps it:
-// Streamline takes our markers and was stable in every test.
+// Off with FSR or XeSS frame generation. FSR's swapchain plus Reflex hung the
+// GPU every time. XeSS has its own latency handling. DLSS frame generation was
+// stable in every test. Streamline takes our markers there.
 //
-// OptiScaler loads every frame generation library up front, so check its
-// FGOutput setting instead. Changes to it only apply after a restart. Without
-// OptiScaler, a loaded AMD library counts as in use.
+// OptiScaler loads every frame generation library up front, so read its
+// FGOutput setting. Without OptiScaler, a loaded AMD library counts as in use.
 bool frame_generation_in_use()
 {
     static const int configured = [] {
@@ -299,7 +290,7 @@ bool frame_generation_in_use()
     return GetModuleHandleW(L"amd_fidelityfx_framegeneration_dx12.dll") != nullptr;
 }
 
-// Only every 120 frames: a module lookup takes the loader lock.
+// Every 120 frames only. A module lookup takes the loader lock.
 bool step_aside()
 {
     static uint32_t frames = 0;
@@ -314,13 +305,12 @@ bool step_aside()
     return aside;
 }
 
-// True when Reflex has work to do this frame. Applies setting and device
-// changes first.
+// Applies setting and device changes first.
 bool active(swapchain *swapchain)
 {
     int wanted = int(g_settings.reflex.load());
     if (wanted == int(reflex_mode::off) && g_applied <= 0)
-        return false; // never on, or already switched off: nothing to do
+        return false; // off and the driver already knows
     if (wanted != int(reflex_mode::off) && step_aside())
         wanted = int(reflex_mode::off);
     if (wanted == int(reflex_mode::off) && g_applied <= 0)
@@ -337,7 +327,7 @@ bool active(swapchain *swapchain)
     auto *native = reinterpret_cast<ID3D12Device *>(dev->get_native());
     if (native != g_device)
     {
-        // New device: resend the setting and restart frame IDs.
+        // New device. Resend the setting and restart frame IDs.
         g_device = native;
         g_applied = -1;
         g_marking = nullptr;
@@ -379,7 +369,7 @@ void on_present(command_queue *, swapchain *swapchain, const rect *, const rect 
 
 void on_finish_present(command_queue *, swapchain *swapchain)
 {
-    // If Reflex was switched on since present, wait for the next frame.
+    // Switched on since present. Wait for the next frame.
     if (g_marking.load() == nullptr || !active(swapchain))
         return;
     marker(g_device, PRESENT_END, g_frame.load());

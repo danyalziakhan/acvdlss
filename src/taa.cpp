@@ -1,12 +1,8 @@
-// Finds Valhalla's TAA pass and replaces it with DLSS.
+// Replaces Valhalla's TAA pass with DLSS.
 //
-// The pass is recognized by its descriptor table: seven same-size textures in
-// a fixed format order, the first three being color, packed motion vectors and
-// linear depth. Its constant buffer has the jitter, and the view constants in
-// root parameter 1 have the camera. On the first draw with that table bound,
-// prepare.hlsl converts the inputs, DLSS runs, and the result is copied into
-// the draw's render target. The TAA draws are skipped and all command list
-// state we touched is restored.
+// The pass is found by its descriptor table: seven same-size textures in a
+// fixed format order. At its first draw prepare.hlsl converts the inputs, DLSS
+// runs into the draw's target, and the TAA draws are skipped.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -42,10 +38,10 @@ using namespace reshade::api;
 
 namespace
 {
-// The root parameter whose table holds the per-view constant buffer.
+// Holds the per-view constant buffer.
 const uint32_t VIEW_PARAM = 1;
 
-// Byte offsets into the TAA pass's constant buffer and the per-view one.
+// Byte offsets into the TAA and per-view constant buffers.
 namespace cb
 {
 const uint32_t TAA_SIZE = 0x100;
@@ -66,13 +62,12 @@ const uint32_t INV_PROJ = 0x450;        // four rows
 } // namespace cb
 // All draws with the TAA table bound belong to the pass we replace.
 const uint32_t MAX_SKIPPED_DRAWS = 3;
-// The game declares large ranges and leaves most slots empty. This caps the
-// work, it doesn't filter.
+// Only caps work. The game declares large, mostly empty ranges.
 const size_t MAX_TABLE_TEXTURES = 64;
 // Frames without a TAA pass before the overlay shows "waiting".
 const uint64_t IDLE_FRAMES = 30;
-// Frames with no TAA pass at all before we log possible causes, and before the
-// pipeline cache rebuild stops waiting for DLSS.
+// No TAA pass for this long. Log possible causes and stop holding the pipeline
+// cache rebuild for DLSS.
 const uint64_t NOTE_FRAMES = 3600;
 
 struct texture_entry
@@ -88,11 +83,10 @@ bool same(const texture_entry &e, format fmt, uint32_t width, uint32_t height)
     return e.fmt == fmt && e.width == width && e.height == height && e.texture_2d;
 }
 
-// Seven same-size textures: color, motion, depth (R32F), mask (R8), color,
-// mask, color. Color is RGBA8, or RGBA16F with HDR. Slot 1 is always RGBA8.
-// Dialogue cutscenes bind a 4x4 placeholder in slot 1 and leave slot 6 empty,
-// so both are allowed. Minimum width 480 (25% scale at 1920 wide). Formats and
-// sizes are what identify the pass.
+// color, motion, depth R32F, mask R8, color, mask, color. Color is RGBA8, or
+// RGBA16F with HDR. Motion is always RGBA8.
+// Dialogue cutscenes bind a 4x4 placeholder for motion and leave slot 6 empty.
+// Min width 480 is 25% scale at 1920.
 int match_taa(const texture_entry *e, size_t n)
 {
     for (size_t i = 0; i + 6 <= n; ++i)
@@ -115,19 +109,21 @@ int match_taa(const texture_entry *e, size_t n)
     return -1;
 }
 
-// Descriptor table contents of a root signature, parsed once at creation.
+// Parsed once when the root signature is created.
 struct table_layout
 {
     bool is_table = false;
     std::vector<uint32_t> textures; // table offsets of every texture SRV, in order
     std::vector<uint32_t> writes;   // and of every texture UAV, for the debug trace
     int32_t first_cbv = -1;
+    // Table offset of the CBV at b0 of each space, 0 for a root CBV, -1 if absent.
+    int32_t b0[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
 };
 
 using layout_tables = std::vector<table_layout>;
 
-// shared_ptr so a command list can keep its entry without a lock, even if the
-// game destroys the root signature meanwhile.
+// shared_ptr so a list keeps its entry lock-free even if the game destroys the
+// root signature.
 std::shared_mutex g_layouts_lock;
 std::unordered_map<uint64_t, std::shared_ptr<const layout_tables>> g_layouts;
 
@@ -138,8 +134,7 @@ std::shared_ptr<const layout_tables> find_layout(pipeline_layout layout)
     return it != g_layouts.end() ? it->second : nullptr;
 }
 
-// A command list's root state, so it can be restored after DLSS binds its own
-// heaps, root signature and pipeline.
+// Saved so it can be restored after DLSS binds its own heaps and root signature.
 enum class root_kind : uint8_t
 {
     none,
@@ -207,11 +202,14 @@ struct pending_delivery
     bool new_site = false; // the first delivery at this pass's root signature
 };
 
+struct screen_effect;
+
 struct __declspec(uuid("3c8e1f52-6a4d-4b9e-8d27-91f0a6c4e7b3")) list_state
 {
     root_state graphics, compute;
     ID3D12PipelineState *pipeline = nullptr;
     resource_view render_target = {0};
+    screen_effect *effect_draw = nullptr; // the bound pipeline draws one of these
 
     // Set when the TAA table is bound, cleared when it goes away.
     bool armed = false;
@@ -221,8 +219,7 @@ struct __declspec(uuid("3c8e1f52-6a4d-4b9e-8d27-91f0a6c4e7b3")) list_state
     uint32_t skipped = 0;
     texture_entry inputs[3];
 
-    // Debug trace of a pass reading the TAA output, logged at the next draw or
-    // dispatch.
+    // Logged at the next draw or dispatch.
     std::string trace;
 
     // A screen-pass table seen at a bind, acted on at the draw after it.
@@ -235,6 +232,7 @@ struct __declspec(uuid("3c8e1f52-6a4d-4b9e-8d27-91f0a6c4e7b3")) list_state
         compute = {};
         pipeline = nullptr;
         render_target = {0};
+        effect_draw = nullptr;
         armed = false;
         trace.clear();
         redirect = {};
@@ -242,11 +240,9 @@ struct __declspec(uuid("3c8e1f52-6a4d-4b9e-8d27-91f0a6c4e7b3")) list_state
     }
 };
 
-// List state is looked up on every bind and draw, thousands of times a frame,
-// and ReShade's lookup is a call plus a search. A list is recorded on one
-// thread at a time, so each thread caches its current one. Destroying a list
-// bumps the generation, which invalidates every thread's cache. The game
-// rarely destroys lists.
+// Looked up thousands of times a frame and ReShade's lookup is slow. A list is
+// recorded on one thread at a time, so cache it per thread. Destroying a list
+// bumps the generation to invalidate the caches.
 std::atomic<uint64_t> g_list_generation{0};
 
 struct list_cache
@@ -326,9 +322,8 @@ void debug_event(const char *format, ...)
 }
 
 //----------------------------------------------------------------------------
-// Debug only: the add-on's own CPU time per handler. Camera movement makes the
-// game bind more tables and stream more textures through these handlers. This
-// separates our cost from the game's.
+// Debug only: our CPU time per handler, to tell our cost from the game's when
+// camera movement drives more binds through them.
 
 enum probe : size_t
 {
@@ -361,8 +356,7 @@ const char *const PROBE_NAMES[P_COUNT] = {
     "texture lock waits",
 };
 
-// The work itself takes well under a microsecond, so a call this long was
-// waiting on something, probably a lock.
+// The work is well under 1 us, so a call this long was waiting, likely on a lock.
 const uint64_t LONG_CALL_NS = 500'000;
 
 struct probe_total
@@ -372,7 +366,6 @@ struct probe_total
 };
 probe_total g_probes[P_COUNT];
 
-// Frames presented so far.
 std::atomic<uint64_t> g_frames{0};
 
 uint64_t now_ns()
@@ -415,8 +408,8 @@ private:
     uint64_t _start;
 };
 
-// The descriptor tracker's handlers run between these two (ReShade calls
-// handlers in registration order).
+// ReShade calls handlers in registration order, so the descriptor tracker's
+// run between these two.
 thread_local uint64_t t_tracking_start = 0;
 
 bool on_tracking_begin(device *, uint32_t, const void *)
@@ -559,8 +552,7 @@ buffer_range buffer_at(const descriptor_tracker &tracking, descriptor_heap heap,
     return tracking.buffer(heap, offset);
 }
 
-// Reads the constant buffer behind a root parameter, bound either as a root
-// CBV or as the first CBV in a table. Returns the failure reason, or nullptr.
+// Root CBV or first CBV in a table. Returns the failure reason or nullptr.
 const char *read_constants(device *dev, const root_state &root, uint32_t param, uint8_t *out, uint32_t size)
 {
     if (param >= root.params.size() || root.params[param].kind == root_kind::none)
@@ -615,9 +607,8 @@ void set_status(context &c, taa_state state, const std::string &message = std::s
     c.status.message = message;
 }
 
-// ReShade keeps a view's resource pointer after the resource is destroyed, and
-// games leave such stale views in slots their shaders never read. Querying a
-// dead resource crashes, so sizes come from this map of live textures.
+// Games leave views to destroyed resources in unused slots. ReShade still
+// returns them and querying one crashes. So sizes come from live textures.
 struct texture_info
 {
     uint32_t width, height;
@@ -626,8 +617,7 @@ struct texture_info
 std::shared_mutex g_textures_lock;
 std::unordered_map<uint64_t, texture_info> g_textures;
 
-// The resource handle in a table slot, or 0. It may be stale, so only compare
-// it, never use it.
+// May be stale. Compare it, never use it.
 uint64_t resource_at(device *dev, const descriptor_tracker &tracking, descriptor_table table, uint32_t binding)
 {
     descriptor_heap heap = {0};
@@ -680,10 +670,8 @@ std::string describe(const texture_entry &e)
     return text;
 }
 
-// Tables with a frame-size depth texture and enough slots to be the TAA that
-// didn't match, each noted once. Logged immediately with Debug on. Otherwise
-// the first few are kept for the "TAA pass never found" log note, for
-// "waiting for the game's anti-aliasing" reports.
+// Tables that look like the TAA's but didn't match. Logged at once with Debug
+// on, else the first few go in the "TAA pass never found" note.
 std::mutex g_near_miss_lock;
 std::unordered_set<uint64_t> g_near_miss_seen;
 std::vector<std::string> g_near_misses;
@@ -723,8 +711,7 @@ uint64_t site_key(pipeline_layout layout, uint32_t param)
     return layout.handle ^ (uint64_t(param) << 56);
 }
 
-// Root signature and parameter pairs where a pass was found. Checked on every
-// table bind, so reads are lock-free. Adds are rare and lock.
+// Checked on every table bind, so reads are lock-free. Adds are rare.
 class site_set
 {
 public:
@@ -758,13 +745,94 @@ private:
     std::mutex _lock;
 };
 
-// Where the TAA table was found. Reading every bound table costs the render
-// threads real CPU time, so once a site is known only tables there are read.
-// A full scan resumes on the first frame the TAA goes missing, which also
-// catches a new root signature made for it later. A periodic full scan was
-// tried and dropped: 30 ms of CPU in busy scenes, a visible hitch every 2 s.
+// Reading every table costs real CPU, so once a site is known only it is read.
+// A full scan resumes the first frame the TAA goes missing.
+// Dropped a periodic full scan: 30 ms in busy scenes, a hitch every 2 s.
 site_set g_taa_sites;
 std::atomic<uint64_t> g_taa_frame{0}; // the last frame DLSS replaced the TAA in
+
+// Screen-fixed effects smear in DLSS history when the camera turns. We
+// neutralize them at the draw and redo them on DLSS's output. The two record
+// on different threads in either order. Hence the fallback to last values.
+struct screen_effect
+{
+    const char *name;
+    uint32_t shader; // FNV-1a of the game's pixel shader
+    uint32_t space;  // its constants are at register b0 of this space
+    uint32_t floats; // how many of them we read
+    std::atomic<uint64_t> pipelines[4] = {};
+
+    std::mutex lock;
+    bool waiting = false;
+    float values[16] = {};
+    float last[16] = {};
+    uint64_t frame = 0; // g_frames when last taken out
+    uint32_t reads = 0, passes = 0, passes_late = 0; // debug counters
+};
+
+// Pixel shader hashes from Steam build 26142239. The math is in the shaders.
+screen_effect g_vignette{"vignette", 0xc5f74a85, 2, 4};
+screen_effect g_radial{"radial blur", 0x641896d3, 4, 16};
+screen_effect g_lens{"lens distortion", 0x1754fdb5, 4, 16};
+screen_effect *const SCREEN_EFFECTS[] = {&g_vignette, &g_radial, &g_lens};
+
+// Nothing to draw without blur or darkening.
+std::optional<radial_constants> make_radial(const float *v)
+{
+    if (v[8] == 0.0f && v[12] == 0.0f && v[13] == 0.0f && v[14] <= 1.0f && v[15] >= 1.0f)
+        return std::nullopt;
+    radial_constants k = {};
+    memcpy(k.c0, v, sizeof(k.c0));
+    memcpy(k.c1, v + 4, sizeof(k.c1));
+    memcpy(k.c2, v + 8, sizeof(k.c2));
+    memcpy(k.c3, v + 12, sizeof(k.c3));
+    return k;
+}
+
+// Nothing to draw without distortion or an added color.
+std::optional<lens_constants> make_lens(const float *v)
+{
+    if (v[6] == 0.0f && v[12] == v[9] && v[13] == v[9] && v[14] == v[9])
+        return std::nullopt;
+    lens_constants k = {};
+    memcpy(k.c1, v + 4, sizeof(k.c1));
+    memcpy(k.c2, v + 8, sizeof(k.c2));
+    memcpy(k.c3, v + 12, sizeof(k.c3));
+    return k;
+}
+
+// False if the effect wasn't drawn lately.
+bool take_values(screen_effect &e, float *out)
+{
+    std::lock_guard lock(e.lock);
+    if (g_frames > e.frame + 2)
+        return false;
+    ++e.passes;
+    e.passes_late += !e.waiting;
+    memcpy(out, e.waiting ? e.values : e.last, sizeof(e.values));
+    e.waiting = false;
+    return true;
+}
+
+void log_screen_effects()
+{
+    static auto next = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next)
+        return;
+    next = now + std::chrono::seconds(1);
+    for (screen_effect *e : SCREEN_EFFECTS)
+    {
+        std::lock_guard lock(e->lock);
+        if (e->reads == 0 && e->passes == 0)
+            continue;
+        char text[200];
+        snprintf(text, sizeof(text), "%s: taken out %u times, %u DLSS passes, %u of them before its draw", e->name,
+                 e->reads, e->passes, e->passes_late);
+        acv_log(reshade::log::level::info, text);
+        e->reads = e->passes = e->passes_late = 0;
+    }
+}
 
 void try_match(command_list *cmd, list_state &st, uint32_t param, descriptor_table table)
 {
@@ -782,8 +850,7 @@ void try_match(command_list *cmd, list_state &st, uint32_t param, descriptor_tab
     if (tracking == nullptr)
         return;
 
-    // Skip empty slots so the cutscene table (seventh slot empty) still lines
-    // up.
+    // Skip empty slots so the cutscene table still lines up.
     texture_entry entries[MAX_TABLE_TEXTURES];
     size_t n = 0;
     for (uint32_t binding : layout->textures)
@@ -810,12 +877,9 @@ void try_match(command_list *cmd, list_state &st, uint32_t param, descriptor_tab
 }
 
 //----------------------------------------------------------------------------
-// Debug trace of passes that read the TAA output. Below 100% resolution scale
-// one of them upscales to the screen, and DLSS must hand its full-size image
-// to that pass.
+// Debug trace of passes reading the TAA output, to find the screen pass.
 
-// The trace reads every table, so sample one frame in this many to avoid
-// skewing the logged timings.
+// Reads every table, so sample to keep the logged timings honest.
 const uint64_t TRACE_EVERY = 600;
 std::atomic<uint64_t> g_taa_output{0};
 std::mutex g_trace_lock;
@@ -861,8 +925,7 @@ void trace_reads(command_list *cmd, list_state &st, bool graphics, uint32_t para
             writes += " [" + std::to_string(binding) + "] " + describe(e);
     }
 
-    // Once per pass and TAA size, since the upscale pass only appears below
-    // 100%.
+    // Keyed on TAA size too, since the upscale pass only appears below 100%.
     const uint64_t key = root.layout.handle ^ (uint64_t(param) << 48) ^ (graphics ? 0 : 1ull << 63) ^ (taa_size << 8);
     {
         std::lock_guard lock(g_trace_lock);
@@ -896,8 +959,7 @@ std::string draw_target(command_list *cmd, const list_state &st)
     return text;
 }
 
-// After DLSS the list has our heaps, root signature and pipeline. Changing
-// heaps invalidates all bound tables, graphics included, so rebind them all.
+// Changing heaps invalidates every bound table, graphics included.
 void restore(device *dev, ID3D12GraphicsCommandList *list, const list_state &st)
 {
     ID3D12DescriptorHeap *heaps[2] = {};
@@ -950,7 +1012,7 @@ void restore(device *dev, ID3D12GraphicsCommandList *list, const list_state &st)
         list->SetPipelineState(st.pipeline);
 }
 
-// DLSS only uses this as a hint. Fall back to 60 fps if missing or absurd.
+// Only a hint to DLSS.
 float frame_time_ms(context &c)
 {
     const auto now = std::chrono::steady_clock::now();
@@ -962,10 +1024,8 @@ float frame_time_ms(context &c)
 }
 
 //----------------------------------------------------------------------------
-// Getting the upscaled frame to the screen. Below 100% a game pass reads the
-// TAA output and upscales it to a screen-size target. We rewrite the SRV it
-// reads right before it draws so it gets our full-size DLSS frame instead.
-// D3D12 has no plain SRV rebind to do this with.
+// Below 100% a game pass upscales the TAA output to the screen. We rewrite the
+// SRV it reads right before its draw so it gets the DLSS frame instead.
 
 struct redirect_site
 {
@@ -974,10 +1034,8 @@ struct redirect_site
     uint32_t binding = 0;
 };
 
-// How long to search for passes reading the frame after its size or texture
-// changes. Found passes stay known. There can be several. With FSR on, a pass
-// reading last frame's TAA output into something screen-sized was found
-// before the real screen pass, which at 100% read FSR 1's output instead.
+// Search window after the frame changes. There can be several readers. With
+// FSR on, a pass reading last frame's TAA output showed up before the real one.
 const uint64_t DISCOVERY_FRAMES = 120;
 const size_t MAX_SITES = 4;
 
@@ -990,19 +1048,16 @@ struct upscale_state
     uint64_t taa_targets[2] = {}; // the game alternates between two
     std::vector<redirect_site> sites;
     uint64_t discover_until = 0;
-    // FSR 1's outputs, when FSR is on in the game. The screen pass reads these
-    // instead of the TAA output, so they get the same redirect. Two passes,
-    // each alternating between two textures.
+    // FSR 1 outputs, read by the screen pass when FSR is on. Two passes, each
+    // alternating two textures.
     uint64_t fsr_chain[4] = {};
     uint32_t fsr_chain_next = 0;
-    // Heap slots we pointed at our frame. Restored if DLSS stops upscaling
-    // while the game still uses the table.
+    // Restored if DLSS stops upscaling while the game still uses the table.
     std::unordered_set<uint64_t> redirected;
 };
 upscale_state g_upscale;
 
-// Lets the per-bind checks skip the lock when nothing is upscaled. Written
-// under the lock.
+// Lets per-bind checks skip the lock. Written under it.
 std::atomic<bool> g_upscale_active{false};
 
 void refresh_active(const upscale_state &u)
@@ -1010,8 +1065,7 @@ void refresh_active(const upscale_state &u)
     g_upscale_active = u.presented != nullptr || !u.redirected.empty();
 }
 
-// Lock-free mirrors for the per-bind checks, which only take the lock at a
-// known site or while discovering.
+// Lock-free mirrors for the per-bind checks.
 std::atomic<uint64_t> g_discover_until{0};
 site_set g_screen_sites; // the same pairs as g_upscale.sites
 site_set g_fsr_sites;    // where EASU and RCAS bind their tables
@@ -1056,9 +1110,8 @@ void stop_upscaling()
     refresh_active(g_upscale);
 }
 
-// At a table bind: does this table read the frame at a known screen pass site?
-// While discovering, any non-TAA table that reads it is a candidate, confirmed
-// at the draw by its target size.
+// While discovering, any non-TAA table reading the frame is a candidate,
+// confirmed at the draw by its target size.
 void check_redirect(command_list *cmd, list_state &st, uint32_t param, descriptor_table table)
 {
     if (!g_upscale_active)
@@ -1160,8 +1213,7 @@ void apply_redirect(command_list *cmd, list_state &st)
         view.Format = g_upscale.format;
         native->CreateShaderResourceView(g_upscale.presented, &view, slot);
         ++g_counts.redirects;
-        // Slots the game allocates fresh every frame would pile up here. A
-        // slot it reuses gets re-added next frame.
+        // Fresh per-frame slots would pile up. Reused ones get re-added.
         if (g_upscale.redirected.size() >= 256)
             g_upscale.redirected.clear();
         g_upscale.redirected.insert(slot_key);
@@ -1175,13 +1227,9 @@ void apply_redirect(command_list *cmd, list_state &st)
     }
 }
 
-// With FSR on in the game, FSR 1 runs in compute between the TAA and the
-// screen pass. EASU upscales the TAA output to the resolution scale's size,
-// RCAS sharpens it into another texture, and the screen pass stretches that to
-// the screen. We skip EASU and RCAS and redirect the screen pass away from
-// their outputs too, so DLSS goes from render size to screen in one step,
-// without the game's sharpening. The DLSS frame is still resampled into each
-// skipped output so nothing reads an unwritten texture.
+// With FSR on, FSR 1 (EASU, then RCAS) runs in compute before the screen pass.
+// We skip both so DLSS goes to screen size in one step without the game's
+// sharpening. Their outputs still get the DLSS frame so nothing reads garbage.
 void check_delivery(command_list *cmd, list_state &st, uint32_t param, descriptor_table table)
 {
     if (!g_upscale_active)
@@ -1204,9 +1252,7 @@ void check_delivery(command_list *cmd, list_state &st, uint32_t param, descripto
         std::copy(std::begin(g_upscale.fsr_chain), std::end(g_upscale.fsr_chain), chain);
     }
 
-    // EASU reads the TAA output and writes something bigger. RCAS reads EASU's
-    // output and writes the same size. Compare resource handles first to
-    // avoid reading every slot in full.
+    // EASU reads the TAA output and writes bigger. RCAS keeps the size.
     bool easu = false, rcas = false;
     uint32_t input_binding = 0;
     for (uint32_t binding : layout->textures)
@@ -1251,9 +1297,8 @@ bool deliver(command_list *cmd, list_state &st)
             return false;
         if (!in_fsr_chain(g_upscale, d.target.handle))
             g_upscale.fsr_chain[g_upscale.fsr_chain_next++ % std::size(g_upscale.fsr_chain)] = d.target.handle;
-        // The game cycles through more outputs than the chain holds, so new
-        // textures are routine. Only a new site reopens discovery. Known sites
-        // already compare against the newest textures.
+        // The game cycles more outputs than the chain holds. Only a new site
+        // reopens discovery.
         if (d.new_site)
         {
             keep_discovering(g_upscale);
@@ -1263,8 +1308,7 @@ bool deliver(command_list *cmd, list_state &st)
         }
     }
 
-    // Written even when the screen pass gets redirected, so a pass that isn't
-    // redirected yet reads a real image instead of stale contents.
+    // Written even when redirected. A pass not redirected yet still reads a real image.
     context &c = *g_ctx;
     device *dev = cmd->get_device();
     const resource_desc desc = dev->get_resource_desc(d.target);
@@ -1277,7 +1321,7 @@ bool deliver(command_list *cmd, list_state &st)
     return true;
 }
 
-// Logs once per reason why a found TAA pass was left to the game.
+// Logs each reason once.
 bool give_up(const std::string &reason)
 {
     ++g_counts.given_up;
@@ -1299,11 +1343,9 @@ void disarm(list_state &st, const char *why)
     st.armed = false;
 }
 
-// Debug only: logs the jitter next to the projection terms for the first
-// frames at each size, and counts distinct positions (recounted when
-// jitter.cpp changes the sequence). The offset is in render pixels, and the
-// projection holds it as (-2x / width, +2y / height) at 0x1a8 and 0x1b8, which
-// is what DLSS expects as is. A sign or unit mistake only shows when upscaling.
+// Debug only. Jitter is in render pixels, which DLSS takes as is. The
+// projection holds it as -2x / width at 0x1a8 and +2y / height at 0x1b8.
+// A sign or unit mistake only shows when upscaling.
 void note_jitter(uint32_t width, uint32_t height, uint32_t output_width, float jx, float jy, const uint8_t *view_cb)
 {
     static uint64_t size = 0;
@@ -1360,8 +1402,7 @@ bool replace(command_list *cmd, list_state &st)
     const texture_entry &color = st.inputs[0], &motion = st.inputs[1], &depth = st.inputs[2];
     const uint32_t width = color.width, height = color.height;
 
-    // The TAA writes to its first render target. Anything else there means
-    // this isn't the pass we know.
+    // Anything else in the first render target means this isn't the pass we know.
     if (st.render_target.handle == 0)
         return give_up("no render target bound");
     const resource target = dev->get_resource_from_view(st.render_target);
@@ -1377,8 +1418,7 @@ bool replace(command_list *cmd, list_state &st)
                        "x" + std::to_string(height));
     if (g_settings.debug)
     {
-        // The output alternates between two textures, so only log size
-        // changes.
+        // The output alternates two textures. Log size changes only.
         g_taa_output = target.handle;
         static std::atomic<uint64_t> logged_size{0};
         const uint64_t size = (uint64_t(width) << 32) | height;
@@ -1414,12 +1454,11 @@ bool replace(command_list *cmd, list_state &st)
     if (c.failed)
         return false;
 
-    // Below 100% DLSS outputs at screen size. At 100% and above it runs as
-    // DLAA at render size, and the game downscales to the screen as usual.
+    // At 100% and above it's DLAA at render size. The game downscales as usual.
     const bool upscale = c.display_width > width && c.display_height > height;
     const uint32_t output_width = upscale ? c.display_width : width;
     const uint32_t output_height = upscale ? c.display_height : height;
-    // Only on mode changes, so log it even without Debug.
+    // Rare enough to log without Debug.
     static uint64_t logged_mode = 0;
     const uint64_t mode = (uint64_t(width) << 48) ^ (uint64_t(height) << 32) ^ (uint64_t(output_width) << 16) ^
                           output_height ^ (hdr ? 1ull << 63 : 0);
@@ -1467,8 +1506,8 @@ bool replace(command_list *cmd, list_state &st)
         note_jitter(width, height, output_width, jx, jy, view_cb);
     frame.frame_ms = frame_time_ms(c);
     {
-        // Reversed device depth is PROJ_23 / z - PROJ_22: 1 at near, 0 at far.
-        // Far is infinite when PROJ_22 is 0.
+        // Reversed device depth is PROJ_23 / z - PROJ_22. Far is infinite when
+        // PROJ_22 is 0.
         const float p11 = read_float(view_cb, cb::PROJ_11);
         const float p22 = read_float(view_cb, cb::PROJ_22), p23 = read_float(view_cb, cb::PROJ_23);
         if (p11 > 0.0f && p23 > 0.0f && p22 > -1.0f)
@@ -1488,12 +1527,19 @@ bool replace(command_list *cmd, list_state &st)
     frame.preset = g_settings.preset;
     // Read once so screen_image() and finish() agree.
     const float sharpness = g_settings.sharpness;
+    screen_fx fx;
+    float values[16];
+    if (take_values(g_vignette, values))
+        fx.vignette = values[0];
+    if (take_values(g_radial, values))
+        fx.radial = make_radial(values);
+    if (take_values(g_lens, values))
+        fx.lens = make_lens(values);
     if (g_settings.hudless)
-        frame.hudless = c.work.screen_image(sharpness, frame.hudless_state);
+        frame.hudless = c.work.screen_image(sharpness, fx, frame.hudless_state);
     jitter_apply(width, output_width);
 
-    // A new preset or size recreates the feature, and the old one may still be
-    // in flight.
+    // A rebuild frees the old feature, which may still be in flight.
     if (c.upscaler.will_rebuild(frame) && c.queue != nullptr)
         c.queue->wait_idle();
 
@@ -1516,7 +1562,7 @@ bool replace(command_list *cmd, list_state &st)
     }
     if (!evaluated)
     {
-        // Let the game's TAA draw, with its own jitter.
+        // Let the game's TAA draw.
         c.work.abandon(list);
         restore(dev, list, st);
         jitter_restore();
@@ -1529,9 +1575,9 @@ bool replace(command_list *cmd, list_state &st)
 
     if (timed)
         g_timer.mark(list, c.frame, 2);
-    // The slider scales RCAS's lobe directly. AMD's stops would jump from off
-    // to quarter strength at the first step.
-    c.work.finish(list, sharpness, hdr, reinterpret_cast<ID3D12Resource *>(target.handle));
+    // The slider scales RCAS's lobe directly. AMD's stops jump from off to
+    // quarter strength.
+    c.work.finish(list, sharpness, hdr, fx, reinterpret_cast<ID3D12Resource *>(target.handle));
     if (timed)
     {
         g_timer.mark(list, c.frame, 3);
@@ -1606,6 +1652,9 @@ table_layout describe_table(uint32_t count, const Range *ranges)
         const descriptor_range &range = ranges[r];
         if (range.type == descriptor_type::constant_buffer && (t.first_cbv < 0 || int32_t(range.binding) < t.first_cbv))
             t.first_cbv = int32_t(range.binding);
+        if (range.type == descriptor_type::constant_buffer && range.dx_register_index == 0 &&
+            range.dx_register_space < std::size(t.b0))
+            t.b0[range.dx_register_space] = int32_t(range.binding);
         // Unbounded ranges report UINT32_MAX. Only the first slots are used.
         const uint32_t slots = std::min<uint32_t>(range.count, MAX_TABLE_TEXTURES);
         std::vector<uint32_t> *into = range.type == descriptor_type::shader_resource_view    ? &t.textures
@@ -1633,6 +1682,11 @@ void on_init_pipeline_layout(device *dev, uint32_t count, const pipeline_layout_
             (*tables)[i] = describe_table(p.descriptor_table.count, p.descriptor_table.ranges);
         else if (p.type == pipeline_layout_param_type::descriptor_table_with_flags)
             (*tables)[i] = describe_table(p.descriptor_table_with_flags.count, p.descriptor_table_with_flags.ranges);
+        else if (p.type == pipeline_layout_param_type::push_descriptors &&
+                 p.push_descriptors.type == descriptor_type::constant_buffer &&
+                 p.push_descriptors.dx_register_index == 0 &&
+                 p.push_descriptors.dx_register_space < std::size(table_layout{}.b0))
+            (*tables)[i].b0[p.push_descriptors.dx_register_space] = 0;
     }
 
     std::unique_lock lock(g_layouts_lock);
@@ -1657,8 +1711,7 @@ void on_init_resource(device *dev, const resource_desc &desc, const subresource_
     g_textures[res.handle] = {desc.texture.width, desc.texture.height, desc.texture.format};
 }
 
-// Freed addresses get reused by other textures, so drop any reference to this
-// one as the frame.
+// Freed addresses get reused by other textures.
 void forget_frame(uint64_t handle)
 {
     uint64_t expected = handle;
@@ -1771,7 +1824,7 @@ void on_push_descriptors(command_list *cmd, shader_stage stages, pipeline_layout
     {
     case descriptor_type::constant_buffer:
     {
-        // ReShade passes buffer + offset. D3D12 wants the GPU address.
+        // D3D12 wants the GPU address.
         const auto &range = *static_cast<const buffer_range *>(update.descriptors);
         auto *buffer = reinterpret_cast<ID3D12Resource *>(range.buffer.handle);
         v.kind = root_kind::cbv;
@@ -1806,10 +1859,134 @@ void on_push_constants(command_list *cmd, shader_stage stages, pipeline_layout, 
     memcpy(v.constants.data() + first, values, count * sizeof(uint32_t));
 }
 
+uint32_t fnv1a(const void *data, size_t size)
+{
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < size; ++i)
+        h = (h ^ static_cast<const uint8_t *>(data)[i]) * 16777619u;
+    return h;
+}
+
+void on_init_pipeline(device *, pipeline_layout, uint32_t count, const pipeline_subobject *objects, pipeline handle)
+{
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        if (objects[i].type != pipeline_subobject_type::pixel_shader || objects[i].data == nullptr)
+            continue;
+        const auto *shader = static_cast<const shader_desc *>(objects[i].data);
+        if (shader->code == nullptr)
+            return;
+        const uint32_t hash = fnv1a(shader->code, shader->code_size);
+        for (screen_effect *e : SCREEN_EFFECTS)
+        {
+            if (hash != e->shader)
+                continue;
+            for (auto &slot : e->pipelines)
+            {
+                uint64_t empty = 0;
+                if (slot.compare_exchange_strong(empty, handle.handle))
+                    return;
+            }
+        }
+        return;
+    }
+}
+
+void on_destroy_pipeline(device *, pipeline handle)
+{
+    for (screen_effect *e : SCREEN_EFFECTS)
+        for (auto &slot : e->pipelines)
+        {
+            uint64_t mine = handle.handle;
+            slot.compare_exchange_strong(mine, 0);
+        }
+}
+
+screen_effect *screen_effect_of(uint64_t pipeline)
+{
+    if (pipeline == 0)
+        return nullptr;
+    for (screen_effect *e : SCREEN_EFFECTS)
+        for (const auto &slot : e->pipelines)
+            if (slot.load(std::memory_order_relaxed) == pipeline)
+                return e;
+    return nullptr;
+}
+
+buffer_range find_b0(device *dev, const root_state &root, uint32_t space)
+{
+    if (root.tables == nullptr || space >= std::size(table_layout{}.b0))
+        return {};
+    for (uint32_t i = 0; i < uint32_t(root.params.size()) && i < root.tables->size(); ++i)
+    {
+        const int32_t at = (*root.tables)[i].b0[space];
+        if (at < 0)
+            continue;
+        const root_value &v = root.params[i];
+        if (v.kind == root_kind::cbv)
+            return v.buffer;
+        if (v.kind != root_kind::table)
+            return {};
+        const auto *tracking = descriptor_tracker::of(dev);
+        if (tracking == nullptr)
+            return {};
+        descriptor_heap heap = {0};
+        uint32_t offset = 0;
+        dev->get_descriptor_heap_offset({v.value}, uint32_t(at), 0, &heap, &offset);
+        return buffer_at(*tracking, heap, offset);
+    }
+    return {};
+}
+
+// The GPU reads the constants when the list runs. Writing now still changes
+// this draw.
+void take_out(screen_effect &e, command_list *cmd, const list_state &st)
+{
+    if (!g_settings.enabled || g_taa_frame == 0 || g_frames > g_taa_frame + 2)
+        return;
+    device *dev = cmd->get_device();
+    const buffer_range range = find_b0(dev, st.graphics, e.space);
+    void *data = nullptr;
+    if (range.buffer.handle == 0 ||
+        !dev->map_buffer_region(range.buffer, range.offset, e.floats * 4, map_access::read_write, &data) ||
+        data == nullptr)
+        return;
+    float values[16] = {};
+    memcpy(values, data, e.floats * 4);
+    float neutral[16];
+    memcpy(neutral, values, sizeof(neutral));
+    if (&e == &g_vignette)
+    {
+        neutral[0] = 0.0f; // strength
+    }
+    else if (&e == &g_radial)
+    {
+        neutral[8] = 0.0f; // no blur
+        neutral[12] = neutral[13] = 0.0f;
+        neutral[14] = neutral[15] = 1.0f; // no darkening
+    }
+    else
+    {
+        neutral[6] = 0.0f; // no distortion
+        neutral[9] = neutral[12] = neutral[13] = neutral[14] = 0.0f; // nothing added
+    }
+    memcpy(data, neutral, e.floats * 4);
+    dev->unmap_buffer_region(range.buffer);
+    std::lock_guard lock(e.lock);
+    ++e.reads;
+    e.waiting = true;
+    memcpy(e.values, values, sizeof(values));
+    memcpy(e.last, values, sizeof(values));
+    e.frame = g_frames;
+}
+
 void on_bind_pipeline(command_list *cmd, pipeline_stage stages, pipeline pipeline)
 {
-    if (g_ctx != nullptr && stages == pipeline_stage::all)
-        state_of(cmd).pipeline = reinterpret_cast<ID3D12PipelineState *>(pipeline.handle);
+    if (g_ctx == nullptr || stages != pipeline_stage::all)
+        return;
+    list_state &st = state_of(cmd);
+    st.pipeline = reinterpret_cast<ID3D12PipelineState *>(pipeline.handle);
+    st.effect_draw = screen_effect_of(pipeline.handle);
 }
 
 void on_bind_render_targets(command_list *cmd, uint32_t count, const resource_view *rtvs, resource_view)
@@ -1826,6 +2003,11 @@ bool on_any_draw(command_list *cmd)
     list_state *st = find_state(cmd);
     if (st == nullptr)
         return false;
+    if (st->effect_draw != nullptr)
+    {
+        take_out(*st->effect_draw, cmd, *st);
+        st->effect_draw = nullptr;
+    }
     if (!st->trace.empty())
         flush_trace(*st, draw_target(cmd, *st));
     if (st->redirect.pending)
@@ -1882,8 +2064,7 @@ bool on_dispatch(command_list *cmd, uint32_t x, uint32_t y, uint32_t z)
     return st->delivery.pending && deliver(cmd, *st);
 }
 
-// Debug only: frame times, probes and GPU timestamps, gathered once a frame.
-// Hitches are logged with the add-on's share of that frame.
+// Debug only. Hitches are logged with our share of that frame.
 struct frame_stats
 {
     uint64_t last_present = 0;
@@ -1894,8 +2075,7 @@ struct frame_stats
     double timestamp_hz = 0.0;
     double gpu_ms[3] = {}, gpu_worst_ms[3] = {}, last_gpu_ms[3] = {};
     uint32_t gpu_frames = 0;
-    // VRAM vs. the driver's budget. Over budget, Windows starts evicting
-    // memory, which stalls the GPU.
+    // Over budget, Windows evicts memory and the GPU stalls.
     IDXGIAdapter3 *adapter = nullptr;
     double vram_gb = 0.0, budget_gb = 0.0, worst_vram_gb = 0.0;
     uint32_t over_budget = 0;
@@ -1954,7 +2134,7 @@ void time_frame(context &c)
         }
     }
 
-    // Probe totals since the last present, all threads.
+    // Since the last present, all threads.
     uint64_t frame_ns[P_COUNT], frame_calls[P_COUNT];
     for (size_t p = 0; p < P_COUNT; ++p)
     {
@@ -2014,7 +2194,6 @@ void summarize_frames()
                     f.dlss_frames, sorted.size());
     }
 
-    // Per-frame average and the slowest single call.
     const double frames = f.times.empty() ? 1.0 : double(f.times.size());
     std::string line, waits;
     char part[128];
@@ -2025,8 +2204,7 @@ void summarize_frames()
         snprintf(part, sizeof(part), "%s%s %.3f ms in %.0f calls, slowest %.0f us", line.empty() ? "" : "; ",
                  PROBE_NAMES[p], double(ns) / 1e6 / frames, double(calls) / frames, double(worst) / 1e3);
         line += part;
-        // Count long calls too: the slowest value alone doesn't show whether
-        // it happened once or every other frame.
+        // The slowest value alone doesn't show if it happened once or often.
         const uint64_t long_calls = g_probes[p].long_calls.exchange(0), long_ns = g_probes[p].long_ns.exchange(0);
         if (long_calls != 0)
         {
@@ -2061,12 +2239,10 @@ void summarize_frames()
     f.times.reserve(600);
 }
 
-// Every frame, Debug or not: checks for a lost device and a TAA pass that
-// never shows up. Cheap, and needed for crash and "waiting for the game's
-// anti-aliasing" reports.
+// Every frame, Debug or not. Cheap, and needed for crash reports.
 void check_device(context &c)
 {
-    // Catches a driver crash or TDR before anything else does.
+    // Catches a driver crash or TDR first.
     static bool device_lost = false;
     const HRESULT removed = reinterpret_cast<ID3D12Device *>(c.dev->get_native())->GetDeviceRemovedReason();
     if (!device_lost && FAILED(removed))
@@ -2077,8 +2253,7 @@ void check_device(context &c)
         acv_log(reshade::log::level::error, text);
     }
 
-    // Menus have no TAA. Log once after a minute, with the closest tables,
-    // and only if DLSS never ran.
+    // Menus have no TAA. Log once after a minute, only if DLSS never ran.
     if (c.frame != NOTE_FRAMES || !c.ready || c.failed || !g_settings.enabled || g_taa_frame != 0)
         return;
     std::string text = "no TAA pass found in the first " + std::to_string(NOTE_FRAMES) +
@@ -2156,6 +2331,8 @@ void taa_register()
     reshade::register_event<reshade::addon_event::push_descriptors>(on_push_descriptors);
     reshade::register_event<reshade::addon_event::push_constants>(on_push_constants);
     reshade::register_event<reshade::addon_event::bind_pipeline>(on_bind_pipeline);
+    reshade::register_event<reshade::addon_event::init_pipeline>(on_init_pipeline);
+    reshade::register_event<reshade::addon_event::destroy_pipeline>(on_destroy_pipeline);
     reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(on_bind_render_targets);
     reshade::register_event<reshade::addon_event::draw>(on_draw);
     reshade::register_event<reshade::addon_event::draw_indexed>(on_draw_indexed);
@@ -2173,10 +2350,8 @@ void taa_unregister()
 }
 
 // Whether this frame counts toward a pipeline cache rebuild. Normally only
-// frames where DLSS replaced the TAA (actual gameplay). When DLSS is off,
-// can't run or never finds the TAA (Anti-aliasing not on High), menus can't be
-// told from play, so every frame counts. Otherwise the cache would be rebuilt
-// at every start.
+// gameplay frames. Without DLSS menus can't be told from play, so every frame
+// counts. Otherwise the cache would be rebuilt at every start.
 static bool present_frame(command_queue *queue, uint32_t display_width, uint32_t display_height)
 {
     std::lock_guard ctx_lock(g_ctx_lock);
@@ -2188,14 +2363,17 @@ static bool present_frame(command_queue *queue, uint32_t display_width, uint32_t
     ++g_frames;
     c.display_width = display_width;
     c.display_height = display_height;
-    // This frame ran without DLSS: give the screen pass the game's image again.
+    // Ran without DLSS. Give the screen pass the game's image again.
     if (c.frame > c.last_replaced)
         stop_upscaling();
     ++c.frame;
     c.work.collect(c.frame);
     check_device(c);
     if (g_settings.debug)
+    {
         debug_frame(c);
+        log_screen_effects();
+    }
     if (!c.ready || c.failed)
         return true;
     const taa_state before = c.status.state;
@@ -2212,7 +2390,7 @@ static bool present_frame(command_queue *queue, uint32_t display_width, uint32_t
 
 void taa_present(command_queue *queue, uint32_t display_width, uint32_t display_height)
 {
-    // Outside the lock, since it may write a file.
+    // Outside the lock. It may write a file.
     lod_frame(present_frame(queue, display_width, display_height));
 }
 

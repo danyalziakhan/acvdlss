@@ -14,12 +14,16 @@ list(REVERSE SDK_BIN)
 find_program(FXC fxc REQUIRED HINTS "$ENV{WindowsSdkVerBinPath}x64" ${SDK_BIN})
 
 set(SHADER_HEADERS)
-foreach(shader prepare rcas downsample)
+set(SHADER_INCLUDES
+    ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vignette.hlsl
+    ${CMAKE_CURRENT_SOURCE_DIR}/shaders/radial.hlsl
+    ${CMAKE_CURRENT_SOURCE_DIR}/shaders/lens.hlsl)
+foreach(shader prepare rcas downsample screen_effects)
     set(header ${CMAKE_CURRENT_BINARY_DIR}/shaders/${shader}.h)
     add_custom_command(
         OUTPUT ${header}
         COMMAND ${FXC} /nologo /T cs_5_0 /E main /O3 /Vn ${shader}_cs /Fh ${header} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${shader}.hlsl
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${shader}.hlsl
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${shader}.hlsl ${SHADER_INCLUDES}
         COMMENT "Compiling ${shader}.hlsl")
     list(APPEND SHADER_HEADERS ${header})
 endforeach()

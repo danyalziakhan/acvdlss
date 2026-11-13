@@ -1,8 +1,6 @@
 // ACV DLSS
 //
-// Replaces Assassin's Creed Valhalla's TAA with NVIDIA DLSS. taa.cpp finds the
-// pass and runs DLSS. This file has the settings, the toggle key and the
-// ACV DLSS window in the ReShade overlay.
+// Settings, toggle key and the overlay window. taa.cpp does the actual work.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -37,8 +35,7 @@ settings g_settings;
 static effect_runtime *g_runtime = nullptr;
 static bool g_overlay_open = false;
 
-// NVIDIA's preset numbers are the index. Letters the current runtime dropped
-// still go through. DLSS treats them as Auto, and the label says so.
+// Index is NVIDIA's preset number. Dropped letters still go through as Auto.
 static const char *PRESETS[] = {
     "Auto",
     "A (removed, acts as Auto)",
@@ -57,7 +54,7 @@ static const char *PRESETS[] = {
 };
 
 //----------------------------------------------------------------------------
-// The toggle key: one key, picked with a button.
+// Toggle key.
 
 static int g_toggle_key = VK_F10;
 static bool g_listening = false;
@@ -69,8 +66,7 @@ static void save_preset(uint32_t preset)
     config_set("DLSS", "Preset", preset == 0 ? "Auto" : letter);
 }
 
-// Saved as the preset's letter, or Auto. Earlier versions saved NVIDIA's
-// number, which is read once and saved back as the letter.
+// Older versions saved NVIDIA's number. Migrated to the letter on read.
 static uint32_t read_preset()
 {
     const std::string text = config_string("DLSS", "Preset", "Auto");
@@ -130,12 +126,10 @@ static void save_toggle_key()
     config_set("General", "ToggleKey", g_toggle_key);
 }
 
-// Top-left indicator shown after DLSS is switched, so the toggle key gives
-// feedback with the overlay closed.
+// Feedback for the toggle key with the overlay closed.
 static const auto INDICATOR_TIME = std::chrono::seconds(3);
 static std::chrono::steady_clock::time_point g_indicator_until;
 
-// Settings changes go to the log beside what they caused.
 static void log_change(const char *format, ...)
 {
     char text[160];
@@ -186,8 +180,7 @@ static std::string utf8(const wchar_t *text)
     return n > 0 ? std::string(out) : std::string();
 }
 
-// The name printed on the key, in the player's keyboard layout where it types
-// a character.
+// As printed on the key, in the player's layout.
 static std::string key_name(uint32_t vk)
 {
     if ((vk >= '0' && vk <= '9') || (vk >= 'A' && vk <= 'Z'))
@@ -226,7 +219,6 @@ static std::string key_name(uint32_t vk)
     case VK_NUMLOCK: return "Num Lock";
     case VK_SCROLL: return "Scroll Lock";
     }
-    // Punctuation and anything rarer, as Windows names it for this layout.
     if (const UINT scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC); scan != 0)
     {
         wchar_t text[48] = L"";
@@ -244,7 +236,7 @@ static void draw_toggle_key(effect_runtime *runtime)
     const std::string name = g_toggle_key != 0 ? key_name(g_toggle_key) : std::string("None");
     const std::string label = (g_listening ? std::string("Press a key, Esc to cancel") : name) + "###toggle_key";
     const int frame = ImGui::GetFrameCount();
-    // Closed or collapsed while listening: drop it rather than wait unseen.
+    // Window closed while listening. Don't wait unseen.
     if (g_listening && frame != g_listen_frame + 1)
         g_listening = false;
     bool started = false;
@@ -254,12 +246,11 @@ static void draw_toggle_key(effect_runtime *runtime)
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Switches DLSS on and off while playing.\nBackspace while picking leaves it without a key.");
 
-    // Ask ReShade, not Windows: Windows reports every key as up while the
-    // overlay has input. Skip the first frame so the Space or Enter that
-    // pressed the button isn't picked up.
+    // Windows reports every key as up while the overlay has input. Skip the
+    // first frame so the Space or Enter that pressed the button isn't taken.
     if (!g_listening || started || runtime == nullptr)
         return;
-    // From the middle mouse button up: the left one pressed the button.
+    // The left mouse button pressed the button.
     for (int vk = VK_MBUTTON; vk < 256; ++vk)
     {
         // The generic modifier codes repeat their left and right forms.
@@ -283,7 +274,6 @@ static void draw_toggle_key(effect_runtime *runtime)
 
 static const ImVec4 WARNING_COLOR(0.96f, 0.73f, 0.24f, 1.0f);
 
-// "DLAA 1920x1200" at the render size, "1344x840 to 1920x1200" when upscaling.
 static std::string describe_mode(const taa_status &s)
 {
     char text[64];
@@ -294,9 +284,7 @@ static std::string describe_mode(const taa_status &s)
     return std::string(text) + (s.hdr ? ", HDR" : "");
 }
 
-// Current bias, plus the one a restart would apply if FSR changed since
-// launch. Hidden when both are 0 (no FSR). Reads the settings file at most
-// once a second.
+// Also shows the bias a restart would apply if FSR changed since launch.
 static void draw_lod_bias()
 {
     static float wanted = lod_bias();
@@ -346,14 +334,12 @@ static void draw_status(const taa_status &s)
     }
 }
 
-// Status takes up to two lines, LOD bias one. Always reserve three so the
-// controls don't move when DLSS is switched.
+// Fixed so the controls don't move when DLSS is switched.
 static const int STATUS_LINES = 3;
 
 static void draw_window(effect_runtime *runtime)
 {
-    // 16:9, wide enough for the longest status line at ReShade's default font
-    // and scaled with the font the user picked.
+    // Fits the longest status line at ReShade's default font size of 13.
     const float scale = ImGui::GetFontSize() / 13.0f;
     ImGui::SetWindowSize(ImVec2(560.0f * scale, 315.0f * scale), ImGuiCond_FirstUseEver);
 
@@ -385,7 +371,7 @@ static void draw_window(effect_runtime *runtime)
         g_settings.sharpness = float(sharpness) / 100.0f;
         config_set("DLSS", "Sharpness", sharpness);
     }
-    // Logged once the drag ends, and only if it ended somewhere new.
+    // Log once per drag.
     static int dragged_from = 0;
     if (ImGui::IsItemActivated())
         dragged_from = sharpness;
@@ -413,13 +399,12 @@ static void draw_window(effect_runtime *runtime)
                                       "power cost.");
 }
 
-// ReShade raises this every frame, overlay open or not, inside its ImGui frame.
+// Every frame, overlay open or not.
 static void on_overlay(effect_runtime *)
 {
     if (std::chrono::steady_clock::now() >= g_indicator_until)
         return;
 
-    // Green only while DLSS is running, otherwise amber. The window has details.
     const taa_status s = taa_get_status();
     std::string text;
     ImVec4 color = WARNING_COLOR;
@@ -491,7 +476,7 @@ static void on_present(effect_runtime *runtime)
         acv_log(reshade::log::level::info, text);
     }
 
-    // With the overlay open the key could be typed into a text box instead.
+    // With the overlay open the key may be meant for a text box.
     if (runtime == g_runtime && !g_overlay_open && toggle_key_pressed())
         set_enabled(!g_settings.enabled, "the toggle key");
     taa_present(runtime->get_command_queue(), width, height);
@@ -502,8 +487,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
     switch (reason)
     {
     case DLL_PROCESS_ATTACH:
-        // Must come before any other ReShade call: reshade.hpp latches the
-        // module handle on first use, and only register_addon passes it.
+        // Must be the first ReShade call. reshade.hpp latches the module handle
+        // on first use and only register_addon passes it.
         if (!reshade::register_addon(module))
             return FALSE;
         load_settings();
@@ -521,8 +506,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_overlay("ACV DLSS", draw_window);
         break;
     case DLL_PROCESS_DETACH:
-        // Unhook the TAA first so no frame can change the jitter after it's
-        // restored.
+        // TAA first, so no frame can change the jitter after the restore.
         taa_unregister();
         reflex_unregister();
         jitter_restore();

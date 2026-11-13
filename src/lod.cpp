@@ -1,31 +1,23 @@
-// Negative mip LOD bias for the game's material textures, limited to what the
-// game streams. The engine picks which mips to load, and the detail it bakes
-// into the ground's texture pages, for the resolution scale's size, not for
-// FSR's smaller render size inside it. Asking for more detail reads mips that
-// aren't loaded, and ground pages baked from them turn black up close. So the
-// bias is log2(FSR render size / resolution scale size): 0 with FSR off, -1
-// with FSR Performance. NVIDIA's guide adds another -1, which read past the
-// loaded mips here at any resolution.
+// Negative mip LOD bias for material textures, limited to what the game streams.
+// The engine loads mips and bakes ground texture pages for the resolution
+// scale's size, not FSR's render size. Reading past the loaded mips turns ground
+// pages black up close. So the bias is log2(FSR render size / scale size).
+// Dropped NVIDIA's extra -1. It read past the loaded mips at any resolution.
 //
-// Valhalla's texture samplers are static samplers in its root signatures, so
-// there's nothing to swap at bind time. The bias goes in at creation (ReShade
-// raises create_sampler for static samplers too). So a new resolution scale
-// needs a restart, and the game's pipeline cache doesn't notice a changed
-// static sampler. Stale pipelines once left interiors without indirect light.
-// When the bias changes, the cache is cleared before the game opens it, and
-// the next start is slow.
+// The samplers are static samplers in root signatures, so the bias goes in at
+// creation. ReShade raises create_sampler for those too. A new scale needs a
+// restart. The game's pipeline cache doesn't notice a changed static sampler
+// and stale pipelines once left interiors without indirect light. So the cache
+// is cleared when the bias changes.
 //
-// A rebuild cut short is just as broken (blinking, blotchy shadows, banded
-// sky). The note in the cache says "building" until the session that cleared
-// it has run REBUILD_TIME of gameplay. A start that still finds "building"
-// clears it again. The note is finished while the game runs, since the game
-// exits without unloading the add-on.
+// A rebuild cut short is just as broken: blinking, blotchy shadows, banded sky.
+// The note says "building" until REBUILD_TIME of gameplay. A start that still
+// finds "building" clears again. The game exits without unloading the add-on,
+// so the note is finished while it runs.
 //
-// Later damage can't be detected. The game writes most of its cache after the
-// add-on's last call (seen: ReShade gone at .766, cache written .870 to .952),
-// and damaged files load fine but render wrong. So a cache without our note is
-// never trusted, and 0.4 rebuilds every install's cache once. Beyond that the
-// README tells players to delete the cache folder.
+// Later damage can't be detected. The game writes most of its cache after our
+// last call (seen: ReShade gone at .766, cache written .870 to .952). So a
+// cache without our note is never trusted.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -54,12 +46,10 @@ using namespace reshade::api;
 
 namespace
 {
-// Bump when wants_bias() or the bias formula changes, so the cache is rebuilt.
-// 3 forces one rebuild for every install with 0.4, replacing caches damaged
-// earlier (interiors without indirect light).
+// Bump when wants_bias() or the formula changes. 3 forces one rebuild in 0.4
+// to replace caches damaged earlier.
 const int RULE_VERSION = 3;
 
-// Long enough for the game to build and save its pipelines.
 const auto REBUILD_TIME = std::chrono::minutes(3);
 // Longer gaps are pauses, loading stalls or the game in the background.
 const auto MAX_FRAME_TIME = std::chrono::milliseconds(250);
@@ -83,10 +73,8 @@ std::filesystem::path game_documents()
     return path;
 }
 
-// FSR render size relative to the resolution scale's size, from the game's
-// settings file. 1 with FSR off. Measured: FSRQuality 1 renders at half size
-// (Performance), 4 renders 744 of 960 (Ultra Quality). 2 and 3 are assumed to
-// follow FSR 1's ratios.
+// Measured: FSRQuality 1 renders at half size, 4 renders 744 of 960.
+// 2 and 3 are assumed to follow FSR 1's ratios.
 float saved_fsr_ratio(const std::filesystem::path &folder)
 {
     const std::wstring ini = (folder / L"ACValhalla.ini").wstring();
@@ -107,8 +95,7 @@ std::string read_file(const std::filesystem::path &path)
     return text;
 }
 
-// Write to a temp file and rename it over the note, so the game exiting
-// mid-write can't leave half a note.
+// Temp file and rename, so exiting mid-write can't leave half a note.
 bool write_note(const std::string &line)
 {
     std::filesystem::path temp = g_note;
@@ -128,8 +115,7 @@ bool write_note(const std::string &line)
     return false;
 }
 
-// Clears the game's pipeline cache unless it was fully built with this bias.
-// Runs at add-on load, before the game can build pipelines.
+// Runs at load, before the game can build pipelines.
 void match_pipeline_cache(const std::filesystem::path &folder)
 {
     const std::filesystem::path cache = folder / L"cache";
@@ -145,7 +131,6 @@ void match_pipeline_cache(const std::filesystem::path &folder)
         return;
     }
 
-    // A cache without our note could be damaged, so rebuild it.
     char rule[16];
     snprintf(rule, sizeof(rule), "rule %d,", RULE_VERSION);
     const char *why = "the LOD bias changed";
@@ -180,10 +165,8 @@ void match_pipeline_cache(const std::filesystem::path &folder)
     }
 }
 
-// Material textures only: wrapping, mipmapped and filtered. Screen-space passes
-// clamp and must not be biased (the exposure pass reads a small mip of the
-// frame to average brightness). Shadow comparison samplers and samplers the
-// game already biases further are skipped too.
+// Material textures wrap. Screen-space passes clamp and must not be biased.
+// The exposure pass reads a small mip of the frame.
 bool wants_bias(const sampler_desc &desc)
 {
     const uint32_t filter = uint32_t(desc.filter);
@@ -193,7 +176,7 @@ bool wants_bias(const sampler_desc &desc)
     return tiles && !comparison && mip_linear && desc.max_lod > 0.0f && desc.mip_lod_bias > g_bias;
 }
 
-// Debug only: the game's own biases on tiling texture samplers, before ours.
+// Debug only.
 std::mutex g_game_biases_lock;
 std::map<float, uint32_t> g_game_biases;
 
@@ -226,7 +209,7 @@ void lod_register()
     const std::filesystem::path folder = game_documents();
     if (folder.empty())
         return;
-    // Applied even with DLSS off, so toggling it doesn't cost a cache rebuild.
+    // Applied even with DLSS off. Toggling it shouldn't cost a cache rebuild.
     g_folder = folder;
     const float ratio = saved_fsr_ratio(folder);
     g_bias = lod_bias_for(ratio);

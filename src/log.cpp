@@ -1,6 +1,5 @@
-// acvdlss.log next to the game's exe. Truncated each session and flushed per
-// line so a crash keeps everything before it. Warnings and errors also go to
-// ReShade's log.
+// acvdlss.log next to the game's exe. Flushed per line so a crash keeps
+// everything before it.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -73,7 +72,6 @@ static std::string module_path(HMODULE module)
 
 static LONG CALLBACK on_exception(EXCEPTION_POINTERS *info);
 
-// The quoted value after a key in one of Steam's .acf files, or empty.
 static std::string acf_value(const std::string &text, const char *key)
 {
     const std::string quoted = std::string("\"") + key + "\"";
@@ -86,7 +84,7 @@ static std::string acf_value(const std::string &text, const char *key)
 }
 
 // The exe has no version resource. Steam copies get the build ID from the app
-// manifest; other copies (Ubisoft Connect included) get the exe's date.
+// manifest. Others get the exe's date.
 static std::string game_build()
 {
     wchar_t exe[MAX_PATH] = L"";
@@ -132,8 +130,6 @@ static std::string game_build()
     return text;
 }
 
-// Versions of the add-on, ReShade and the game, plus the game settings that
-// affect the add-on.
 void log_start()
 {
     HMODULE self = nullptr;
@@ -151,7 +147,6 @@ void log_start()
     acv_log(reshade::log::level::info, text.c_str());
     AddVectoredExceptionHandler(0, on_exception);
 
-    // The settings file the game will start with.
     wchar_t documents[MAX_PATH] = L"";
     if (SHGetFolderPathW(nullptr, CSIDL_PERSONAL, nullptr, SHGFP_TYPE_CURRENT, documents) != S_OK)
         return;
@@ -169,7 +164,7 @@ void log_start()
     acv_log(reshade::log::level::info, text.c_str());
 }
 
-// "RenoDX+0x1234" for a code address, or the bare address outside any module.
+// "module+0x1234", or the bare address outside any module.
 static std::string where(DWORD64 address)
 {
     HMODULE module = nullptr;
@@ -189,10 +184,8 @@ static std::string where(DWORD64 address)
     return text;
 }
 
-// The game's crash handler kills the process without anything reaching our
-// log, so log access violations as they happen, with a call stack. Games can
-// raise and handle these on purpose, hence the cap and the "if the game
-// crashed" wording.
+// The game's crash handler kills the process before anything reaches our log.
+// Games also raise and handle these on purpose. Hence the cap and the wording.
 static LONG CALLBACK on_exception(EXCEPTION_POINTERS *info)
 {
     if (info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
@@ -217,7 +210,7 @@ static LONG CALLBACK on_exception(EXCEPTION_POINTERS *info)
         PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context.Rip, &image, nullptr);
         if (function == nullptr)
         {
-            // A leaf function: the return address is on top of the stack.
+            // Leaf function. The return address is on top of the stack.
             context.Rip = *reinterpret_cast<const DWORD64 *>(context.Rsp);
             context.Rsp += 8;
             continue;
@@ -266,9 +259,8 @@ void log_adapter(ID3D12Device *device)
     acv_log(reshade::log::level::info, line.c_str());
 }
 
-// Modules loaded from the game folder (where mods live) and NGX modules from
-// anywhere, with versions. Most bug reports come down to another upscaler, an
-// old nvngx_dlss.dll or a second DLSS-NR.
+// Most bug reports come down to another upscaler, an old nvngx_dlss.dll or a
+// second DLSS-NR.
 void log_modules()
 {
     const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());

@@ -24,7 +24,6 @@
 // NGX accepts any stable GUID as a project ID.
 static const char *PROJECT_ID = "5c3f9a1e-7b2d-4e8a-9f61-0d4c2b7e3a95";
 
-// Lets a report tell an official nvngx_dlssnr.dll from a modified one, since
 // NGX only loads signed DLLs. Cached certificate data only, so startup never
 // waits on the network.
 static const char *signature_of(const std::wstring &path)
@@ -50,8 +49,7 @@ static const char *signature_of(const std::wstring &path)
 #endif
 }
 
-// The DLSS DLLs beside the game, for reports: RenoDX DLSS runs DLSS 5 (neural
-// rendering) from nvngx_dlssnr.dll on the same NVIDIA runtime as our DLSS.
+// nvngx_dlssnr.dll is DLSS 5 and shares the NVIDIA runtime with ours.
 static void log_versions(const std::wstring &folder)
 {
     std::string text;
@@ -84,7 +82,7 @@ static void NVSDK_CONV log_ngx(const char *message, NVSDK_NGX_Logging_Level, NVS
     acv_log(reshade::log::level::info, line.c_str());
 }
 
-// NVIDIA's numbers: 0 lets DLSS choose, 1 to 13 are A to M.
+// 0 lets DLSS choose, 1 to 13 are A to M.
 static std::string preset_name(uint32_t preset)
 {
     if (preset == 0 || preset > 26)
@@ -110,8 +108,7 @@ bool dlss::init(ID3D12Device *device, bool log)
     _device = device;
     const std::wstring folder = game_folder();
     log_versions(folder);
-    // NGX looks next to the exe on its own. Naming the folder also covers
-    // launchers that start the game from somewhere else.
+    // For launchers that start the game from another folder.
     const wchar_t *paths[] = {folder.c_str()};
     NVSDK_NGX_FeatureCommonInfo info = {};
     info.PathListInfo.Path = paths;
@@ -122,17 +119,16 @@ bool dlss::init(ID3D12Device *device, bool log)
         info.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_ON;
     }
 
-    // NGX doesn't report a missing DLL as such, so check for it ourselves to
-    // give a useful error.
+    // NGX doesn't report a missing DLL as such.
     const std::wstring dll = folder + L"\\nvngx_dlss.dll";
     const bool dll_missing = GetFileAttributesW(dll.c_str()) == INVALID_FILE_ATTRIBUTES;
     const char *const MISSING = "nvngx_dlss.dll is not in the game folder";
 
-    // NGX writes log files into its data folder, so give it a separate one.
+    // NGX writes logs into its data folder.
     const std::wstring data = folder + L"\\acvdlss";
     CreateDirectoryW(data.c_str(), nullptr);
-    // Keep DLSS 5 out of our startup (see ngx_guard.h). NGX may load features
-    // both in Init and in GetCapabilityParameters.
+    // See ngx_guard.h. NGX may load features in both Init and
+    // GetCapabilityParameters.
     std::optional<ngx_guard> guard(std::in_place, folder);
     NVSDK_NGX_Result result = NVSDK_NGX_D3D12_Init_with_ProjectID(
         PROJECT_ID, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0", data.c_str(), device, &info);
@@ -187,7 +183,7 @@ void dlss::release_feature()
 }
 
 // DLSS takes the exact render size whatever the mode. The mode only picks the
-// tuning, so use the one nearest the game's resolution scale.
+// tuning.
 static NVSDK_NGX_PerfQuality_Value quality_for(const dlss_frame &frame)
 {
     const float scale = float(frame.width) / float(frame.output_width);
@@ -204,8 +200,7 @@ static NVSDK_NGX_PerfQuality_Value quality_for(const dlss_frame &frame)
 
 bool dlss::create(ID3D12GraphicsCommandList *list, const dlss_frame &frame)
 {
-    // The preset is a hint per quality mode. Set it on all of them so it holds
-    // whichever mode the resolution scale picks.
+    // The preset is a hint per quality mode. Set it on all of them.
     const char *hints[] = {
         NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA,
         NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality,
@@ -223,9 +218,8 @@ bool dlss::create(ID3D12GraphicsCommandList *list, const dlss_frame &frame)
     create.Feature.InTargetWidth = frame.output_width;
     create.Feature.InTargetHeight = frame.output_height;
     create.Feature.InPerfQualityValue = quality_for(frame);
-    // Depth is reversed and motion vectors have no jitter. There's no exposure
-    // value to pass, so use auto exposure, in SDR too: players report less
-    // ghosting with it in other games.
+    // No exposure value to pass, so auto exposure, in SDR too. Players report
+    // less ghosting with it in other games.
     create.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
                                   NVSDK_NGX_DLSS_Feature_Flags_DepthInverted |
                                   NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
@@ -246,7 +240,7 @@ bool dlss::create(ID3D12GraphicsCommandList *list, const dlss_frame &frame)
     _hdr = frame.hdr;
     _preset = frame.preset;
     _error.clear();
-    // Only on size or preset changes, so log it even without Debug.
+    // Rare enough to log without Debug.
     char text[160];
     snprintf(text, sizeof(text), "DLSS created: %ux%u to %ux%u, %s mode, preset %s%s", frame.width, frame.height,
              frame.output_width, frame.output_height, quality_name(create.Feature.InPerfQualityValue),
@@ -282,18 +276,16 @@ bool dlss::evaluate(ID3D12GraphicsCommandList *list, const dlss_frame &frame)
     eval.InJitterOffsetY = frame.jitter_y;
     eval.InRenderSubrectDimensions = {frame.width, frame.height};
     eval.InReset = frame.reset || changed ? 1 : 0;
-    // Motion vectors are in UV units. DLSS wants pixels.
+    // UV units to pixels.
     eval.InMVScaleX = float(frame.width);
     eval.InMVScaleY = float(frame.height);
     eval.InFrameTimeDeltaInMsec = frame.frame_ms;
-    // Ignored by DLSS. Frame generation tools that hook DLSS read the camera
-    // from these names.
+    // Ignored by DLSS. Frame generation tools read the camera from these.
     NVSDK_NGX_Parameter_SetF(_params, "FSR.cameraNear", frame.camera_near);
     NVSDK_NGX_Parameter_SetF(_params, "FSR.cameraFar", frame.camera_far);
     NVSDK_NGX_Parameter_SetF(_params, "FSR.cameraFovAngleVertical", frame.camera_fov);
-    // OptiScaler's frame generation uses this as the HUD-less image instead of
-    // searching for one (its HUD fix). The parameter block persists across
-    // frames, so this is also set (to null) when off.
+    // HUD-less image for OptiScaler's frame generation. The parameter block
+    // persists across frames, so it's set to null when off.
     NVSDK_NGX_Parameter_SetD3d12Resource(_params, "Opti.Hudless", frame.hudless);
     NVSDK_NGX_Parameter_SetUI(_params, "Opti.Hudless.State", frame.hudless_state);
 

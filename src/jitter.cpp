@@ -12,10 +12,9 @@
 //   48 03 CA FF E1          add rcx, rdx ; jmp rcx
 //
 // Cases 1 to 4 mask the frame number with 3, 7, 15 and 31 and call the same
-// generator (4, 8, 16 and 32 positions). The game always takes case 2.
-// Pointing that table entry at case 3 or 4 gives 16 or 32 positions from the
-// game's own code, so the projection, the TAA constants and the jitter we pass
-// DLSS stay in sync. Nothing is patched unless every case matches exactly.
+// generator. The game always takes case 2. Pointing its entry at case 3 or 4
+// gives 16 or 32 positions from the game's own code, so the projection and TAA
+// constants stay in sync. Nothing is patched unless every case matches.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -62,8 +61,7 @@ const uint32_t CASE_SIZE = 10; // and ebx, mask ; mov ecx, ebx ; call
 
 std::atomic<uint32_t *> g_entry{nullptr};         // the table entry the game takes
 uint32_t g_case8 = 0, g_case16 = 0, g_case32 = 0; // RVAs of the three cases
-// The render thread and the present thread both write the entry and change
-// the page's protection.
+// The render and present threads both write the entry.
 std::mutex g_write_lock;
 uint32_t g_positions = 0; // under g_write_lock
 
@@ -134,8 +132,7 @@ void find()
         return;
     }
 
-    // The lea must load the image base, and the table must be inside the image
-    // and 4-byte aligned so one store can swap an entry.
+    // The table must be 4-byte aligned so one store swaps an entry.
     int32_t lea;
     memcpy(&lea, found + LEA_AT + 3, 4);
     uint32_t table_rva;
@@ -166,8 +163,7 @@ void find()
     acv_log(reshade::log::level::info, text);
 }
 
-// The thread holds a reference to this module so the add-on can't be unloaded
-// mid-scan.
+// Holds a module reference so the add-on can't unload mid-scan.
 DWORD WINAPI find_thread(void *module)
 {
     find();

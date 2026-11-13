@@ -3,13 +3,14 @@
 #include <downsample.h>
 #include <prepare.h>
 #include <rcas.h>
+#include <screen_effects.h>
 
 #include <cstdio>
 #include <iterator>
 #include <utility>
 
-// Six descriptors per dispatch (three in, three out). At most three dispatches
-// a frame, so a slot is reused after 21 frames, far more than the GPU lags.
+// Three in, three out. At most three dispatches a frame, so a slot is reused
+// after 21 frames, far more than the GPU lags.
 static const uint32_t SLOT_SIZE = 6;
 static const uint32_t SLOT_COUNT = 64;
 // The game queues at most three frames.
@@ -96,6 +97,7 @@ bool passes::init(ID3D12Device *device)
         {prepare_cs, sizeof(prepare_cs), &_prepare, "the prepare pass"},
         {rcas_cs, sizeof(rcas_cs), &_rcas, "the sharpening pass"},
         {downsample_cs, sizeof(downsample_cs), &_downsample, "the downsample pass"},
+        {screen_effects_cs, sizeof(screen_effects_cs), &_screen_effects, "the screen effects pass"},
     };
     for (const auto &shader : shaders)
     {
@@ -130,6 +132,7 @@ void passes::shutdown()
     _retired.clear();
     release(_heap);
     release(_downsample);
+    release(_screen_effects);
     release(_rcas);
     release(_prepare);
     release(_root);
@@ -185,7 +188,7 @@ bool passes::resize(uint32_t width, uint32_t height, uint32_t output_width, uint
     _output = make_texture(color_format, output_width, output_height, uav);
     _sharpened = make_texture(color_format, output_width, output_height, uav);
     bool ok = _color && _motion && _depth && _output && _sharpened;
-    // Named for GPU crash dumps, which list allocations near a page fault.
+    // GPU crash dumps list allocations near a page fault.
     const std::pair<ID3D12Resource *, const wchar_t *> names[] = {
         {_color, L"ACV DLSS input color"}, {_motion, L"ACV DLSS input motion"}, {_depth, L"ACV DLSS input depth"},
         {_output, L"ACV DLSS output"},     {_sharpened, L"ACV DLSS sharpened"},
@@ -264,8 +267,7 @@ void passes::write_uav(D3D12_CPU_DESCRIPTOR_HANDLE at, ID3D12Resource *resource,
     _device->CreateUnorderedAccessView(resource, nullptr, &desc, at);
 }
 
-// One source in our color format, one target. Used by RCAS, downsample and
-// deliver().
+// One source in our color format, one target.
 void passes::dispatch(ID3D12GraphicsCommandList *list, ID3D12PipelineState *pipeline, const void *constants,
                       uint32_t constant_count, ID3D12Resource *source, ID3D12Resource *target,
                       DXGI_FORMAT target_format, uint32_t width, uint32_t height)
@@ -315,7 +317,8 @@ void passes::prepare(ID3D12GraphicsCommandList *list, const game_texture &color,
     list->ResourceBarrier(UINT(std::size(barriers)), barriers);
 }
 
-void passes::finish(ID3D12GraphicsCommandList *list, float sharpness, bool hdr, ID3D12Resource *taa_target)
+void passes::finish(ID3D12GraphicsCommandList *list, float sharpness, bool hdr, const screen_fx &fx,
+                    ID3D12Resource *taa_target)
 {
     ID3D12Resource *result = _output;
     if (sharpness > 0.0f)
@@ -331,11 +334,38 @@ void passes::finish(ID3D12GraphicsCommandList *list, float sharpness, bool hdr, 
         result = _sharpened;
     }
 
+    // Into the other output-size texture.
+    if (fx.any())
+    {
+        ID3D12Resource *other = result == _output ? _sharpened : _output;
+        screen_effect_constants constants = {};
+        constants.size[0] = float(_output_width);
+        constants.size[1] = float(_output_height);
+        constants.size[2] = 1.0f / float(_output_width);
+        constants.size[3] = 1.0f / float(_output_height);
+        constants.flags[0] = fx.vignette;
+        constants.flags[1] = hdr ? 1.0f : 0.0f;
+        constants.flags[2] = fx.radial ? 1.0f : 0.0f;
+        constants.flags[3] = fx.lens ? 1.0f : 0.0f;
+        if (fx.radial)
+            constants.radial = *fx.radial;
+        if (fx.lens)
+            constants.lens = *fx.lens;
+        const D3D12_RESOURCE_BARRIER readable =
+            transition(result, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        list->ResourceBarrier(1, &readable);
+        dispatch(list, _screen_effects, &constants, sizeof(constants) / 4, result, other, _color_format,
+                 _output_width, _output_height);
+        const D3D12_RESOURCE_BARRIER back =
+            transition(result, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        list->ResourceBarrier(1, &back);
+        result = other;
+    }
+
     const D3D12_RESOURCE_BARRIER to_read = transition(result, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, READABLE);
     list->ResourceBarrier(1, &to_read);
 
-    // The TAA target is render size: DLSS output at DLAA, downsampled when
-    // upscaling.
+    // The TAA target is render size. Downsample when upscaling.
     ID3D12Resource *for_taa = result;
     if (upscaling())
     {
@@ -352,8 +382,7 @@ void passes::finish(ID3D12GraphicsCommandList *list, float sharpness, bool hdr, 
         for_taa = _downsampled;
     }
 
-    // The game's TAA draws into this target, so it's a render target now and
-    // must be one again afterwards.
+    // The TAA draws into it, so it must be a render target again afterward.
     const D3D12_RESOURCE_BARRIER to_copy =
         transition(taa_target, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
     list->ResourceBarrier(1, &to_copy);
@@ -370,17 +399,19 @@ void passes::finish(ID3D12GraphicsCommandList *list, float sharpness, bool hdr, 
     abandon(list);
 }
 
-ID3D12Resource *passes::screen_image(float sharpness, uint32_t &state) const
+ID3D12Resource *passes::screen_image(float sharpness, const screen_fx &fx, uint32_t &state) const
 {
-    // When upscaling, the full-size image is the copy delivered later. At DLAA
-    // it's the one finish() copied into the TAA target.
+    // When upscaling it's the copy delivered later. At DLAA it's the TAA target.
     if (upscaling())
     {
         state = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
         return _presented;
     }
     state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    return sharpness > 0.0f ? _sharpened : _output;
+    ID3D12Resource *image = sharpness > 0.0f ? _sharpened : _output;
+    if (fx.any())
+        image = image == _output ? _sharpened : _output;
+    return image;
 }
 
 void passes::abandon(ID3D12GraphicsCommandList *list)
@@ -396,8 +427,7 @@ void passes::abandon(ID3D12GraphicsCommandList *list)
 void passes::deliver(ID3D12GraphicsCommandList *list, ID3D12Resource *target, DXGI_FORMAT format, uint32_t width,
                      uint32_t height)
 {
-    // The downsample pass samples by UV, so it handles any size. At 1:1 it's a
-    // format-converting copy.
+    // Samples by UV, so any size works. At 1:1 it's a format-converting copy.
     dispatch(list, _downsample, nullptr, 0, _presented, target, format, width, height);
     D3D12_RESOURCE_BARRIER written = {};
     written.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
