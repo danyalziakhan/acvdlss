@@ -24,8 +24,7 @@
 // NGX accepts any stable GUID as a project ID.
 static const char *PROJECT_ID = "5c3f9a1e-7b2d-4e8a-9f61-0d4c2b7e3a95";
 
-// NGX only loads signed DLLs. Cached certificate data only, so startup never
-// waits on the network.
+// NGX only loads signed DLLs. Checks use cached certificate data only. Startup never waits on the network.
 static const char *signature_of(const std::wstring &path)
 {
 #ifdef ACVDLSS_PLAIN
@@ -127,8 +126,7 @@ bool dlss::init(ID3D12Device *device, bool log)
     // NGX writes logs into its data folder.
     const std::wstring data = folder + L"\\acvdlss";
     CreateDirectoryW(data.c_str(), nullptr);
-    // See ngx_guard.h. NGX may load features in both Init and
-    // GetCapabilityParameters.
+    // See ngx_guard.h. NGX may load features in both Init and GetCapabilityParameters.
     std::optional<ngx_guard> guard(std::in_place, folder);
     NVSDK_NGX_Result result = NVSDK_NGX_D3D12_Init_with_ProjectID(
         PROJECT_ID, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0", data.c_str(), device, &info);
@@ -182,8 +180,7 @@ void dlss::release_feature()
     _feature = nullptr;
 }
 
-// DLSS takes the exact render size whatever the mode. The mode only picks the
-// tuning.
+// DLSS takes the exact render size whatever the mode. The mode only picks the tuning.
 static NVSDK_NGX_PerfQuality_Value quality_for(const dlss_frame &frame)
 {
     const float scale = float(frame.width) / float(frame.output_width);
@@ -218,8 +215,8 @@ bool dlss::create(ID3D12GraphicsCommandList *list, const dlss_frame &frame)
     create.Feature.InTargetWidth = frame.output_width;
     create.Feature.InTargetHeight = frame.output_height;
     create.Feature.InPerfQualityValue = quality_for(frame);
-    // No exposure value to pass, so auto exposure, in SDR too. Players report
-    // less ghosting with it in other games.
+    // No exposure value to pass. Auto exposure is on in SDR too.
+    // Players report less ghosting with it in other games.
     create.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
                                   NVSDK_NGX_DLSS_Feature_Flags_DepthInverted |
                                   NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
@@ -284,8 +281,8 @@ bool dlss::evaluate(ID3D12GraphicsCommandList *list, const dlss_frame &frame)
     NVSDK_NGX_Parameter_SetF(_params, "FSR.cameraNear", frame.camera_near);
     NVSDK_NGX_Parameter_SetF(_params, "FSR.cameraFar", frame.camera_far);
     NVSDK_NGX_Parameter_SetF(_params, "FSR.cameraFovAngleVertical", frame.camera_fov);
-    // HUD-less image for OptiScaler's frame generation. The parameter block
-    // persists across frames, so it's set to null when off.
+    // HUD-less image for OptiScaler's frame generation. The parameter block persists across frames.
+    // So it is set to null when off.
     NVSDK_NGX_Parameter_SetD3d12Resource(_params, "Opti.Hudless", frame.hudless);
     NVSDK_NGX_Parameter_SetUI(_params, "Opti.Hudless.State", frame.hudless_state);
 

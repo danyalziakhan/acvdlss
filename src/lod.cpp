@@ -1,23 +1,19 @@
-// Negative mip LOD bias for material textures, limited to what the game streams.
-// The engine loads mips and bakes ground texture pages for the resolution
-// scale's size, not FSR's render size. Reading past the loaded mips turns ground
-// pages black up close. So the bias is log2(FSR render size / scale size).
-// Dropped NVIDIA's extra -1. It read past the loaded mips at any resolution.
+// Negative mip LOD bias for material textures. Limited to what the game streams. The engine loads mips and
+// bakes ground texture pages for the resolution scale's size and not FSR's render size. Reading past the
+// loaded mips turns ground pages black up close. So the bias is log2(FSR render size / scale size). NVIDIA's
+// suggested extra -1 is left out. It read past the loaded mips at any resolution.
 //
-// The samplers are static samplers in root signatures, so the bias goes in at
-// creation. ReShade raises create_sampler for those too. A new scale needs a
-// restart. The game's pipeline cache doesn't notice a changed static sampler
-// and stale pipelines once left interiors without indirect light. So the cache
-// is cleared when the bias changes.
+// The samplers are static samplers in root signatures. The bias goes in at creation. ReShade raises
+// create_sampler for those too. A new scale needs a restart. The game's pipeline cache doesn't notice a
+// changed static sampler. Stale pipelines once left interiors without indirect light. So the cache is
+// cleared when the bias changes.
 //
-// A rebuild cut short is just as broken: blinking, blotchy shadows, banded sky.
-// The note says "building" until REBUILD_TIME of gameplay. A start that still
-// finds "building" clears again. The game exits without unloading the add-on,
-// so the note is finished while it runs.
+// A rebuild cut short is just as broken: blinking, blotchy shadows and banded sky. The note says "building"
+// until REBUILD_TIME of gameplay. A start that still finds "building" clears again. The game exits without
+// unloading the add-on. So the note is finished while the game runs.
 //
-// Later damage can't be detected. The game writes most of its cache after our
-// last call (seen: ReShade gone at .766, cache written .870 to .952). So a
-// cache without our note is never trusted.
+// Later damage can't be detected. The game writes most of its cache after our last call. In one log ReShade
+// was gone at .766 and the cache was written .870 to .952. So a cache without our note is never trusted.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -46,8 +42,7 @@ using namespace reshade::api;
 
 namespace
 {
-// Bump when wants_bias() or the formula changes. 3 forces one rebuild in 0.4
-// to replace caches damaged earlier.
+// Bump when wants_bias() or the formula changes. 3 forces one rebuild in 0.4 to replace damaged caches.
 const int RULE_VERSION = 3;
 
 const auto REBUILD_TIME = std::chrono::minutes(3);
@@ -57,7 +52,7 @@ const auto MAX_FRAME_TIME = std::chrono::milliseconds(250);
 float g_bias = 0.0f;
 std::atomic<uint32_t> g_biased{0};
 
-std::filesystem::path g_note; // inside the cache, so it goes when the cache does
+std::filesystem::path g_note; // inside the cache. Goes when the cache does
 std::string g_finished;       // what the note says once the rebuild is done
 bool g_building = false;      // this session cleared the cache
 std::chrono::steady_clock::duration g_gameplay{};
@@ -73,7 +68,7 @@ std::filesystem::path game_documents()
     return path;
 }
 
-// Measured: FSRQuality 1 renders at half size, 4 renders 744 of 960.
+// Measured: FSRQuality 1 renders at half size. 4 renders 744 of 960.
 // 2 and 3 are assumed to follow FSR 1's ratios.
 float saved_fsr_ratio(const std::filesystem::path &folder)
 {
@@ -95,7 +90,7 @@ std::string read_file(const std::filesystem::path &path)
     return text;
 }
 
-// Temp file and rename, so exiting mid-write can't leave half a note.
+// Temp file and rename. Exiting mid-write can't leave half a note.
 bool write_note(const std::string &line)
 {
     std::filesystem::path temp = g_note;
@@ -127,7 +122,7 @@ void match_pipeline_cache(const std::filesystem::path &folder)
     const std::string note = read_file(g_note);
     if (note == g_finished)
     {
-        acv_log(reshade::log::level::info, "pipeline cache matches this LOD bias, kept");
+        acv_log(reshade::log::level::info, "kept the pipeline cache. It matches this LOD bias");
         return;
     }
 
@@ -147,7 +142,7 @@ void match_pipeline_cache(const std::filesystem::path &folder)
         if (error)
         {
             acv_log(reshade::log::level::warning,
-                    "could not clear the game's pipeline cache, so the LOD bias stays off this session");
+                    "could not clear the game's pipeline cache. The LOD bias stays off this session");
             g_bias = 0.0f;
             return;
         }
@@ -160,7 +155,7 @@ void match_pipeline_cache(const std::filesystem::path &folder)
     if (!g_building)
     {
         acv_log(reshade::log::level::warning,
-                "could not write to the game's pipeline cache, so the LOD bias stays off this session");
+                "could not write to the game's pipeline cache. The LOD bias stays off this session");
         g_bias = 0.0f;
     }
 }
@@ -217,7 +212,7 @@ void lod_register()
     if (ratio < 1.0f)
         snprintf(text, sizeof(text), "LOD bias %+.2f for FSR rendering at %.0f%%", g_bias, ratio * 100.0f);
     else
-        snprintf(text, sizeof(text), "LOD bias 0, FSR is off");
+        snprintf(text, sizeof(text), "LOD bias 0 with FSR off");
     acv_log(reshade::log::level::info, text);
     match_pipeline_cache(folder);
     reshade::register_event<reshade::addon_event::create_sampler>(on_create_sampler);
@@ -241,7 +236,7 @@ void lod_frame(bool gameplay)
         acv_log(reshade::log::level::info, "pipeline cache rebuilt");
     else
         acv_log(reshade::log::level::warning,
-                "could not mark the pipeline cache as rebuilt, so the next start clears it again");
+                "could not mark the pipeline cache as rebuilt. The next start clears it again");
 }
 
 float lod_bias_for(float fsr_ratio)

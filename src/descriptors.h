@@ -7,9 +7,8 @@
 #include <mutex>
 #include <unordered_map>
 
-// Tracks descriptor heap writes so bound tables can be read back. The game
-// writes thousands a frame from several threads, so slots live in fixed
-// chunks indexed by shift and mask with no lock. Samplers aren't tracked.
+// Tracks descriptor heap writes so bound tables can be read back. Samplers aren't tracked.
+// The game writes thousands a frame from several threads. Slots live in fixed chunks with no lock.
 class __declspec(uuid("6a0e3c94-58d1-4f7b-a2c6-0b9e7d51f3a8")) descriptor_tracker
 {
 public:
@@ -49,9 +48,9 @@ private:
     const heap_data *find_heap(uint64_t handle) const;
     heap_data *heap(uint64_t handle);
 
-    // For the per-thread cache, since a later tracker could reuse the address.
+    // Keys the per-thread cache. A later tracker could reuse this one's address.
     uint64_t _id;
-    mutable std::mutex _lock; // guards _heaps, taken on per-thread cache misses
+    mutable std::mutex _lock; // guards _heaps. Taken on per-thread cache misses.
     std::unordered_map<uint64_t, heap_data *> _heaps;
 
     static bool on_copy(reshade::api::device *device, uint32_t count, const reshade::api::descriptor_table_copy *copies);

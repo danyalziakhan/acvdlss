@@ -9,8 +9,8 @@
 #include <iterator>
 #include <utility>
 
-// Three in, three out. At most three dispatches a frame, so a slot is reused
-// after 21 frames, far more than the GPU lags.
+// Three views in and three out. With at most three dispatches a frame a slot is reused after 21 frames.
+// The GPU lags far less than that.
 static const uint32_t SLOT_SIZE = 6;
 static const uint32_t SLOT_COUNT = 64;
 // The game queues at most three frames.
@@ -139,7 +139,8 @@ void passes::shutdown()
     _device = nullptr;
 }
 
-ID3D12Resource *passes::make_texture(DXGI_FORMAT format, uint32_t width, uint32_t height, D3D12_RESOURCE_STATES state)
+ID3D12Resource *passes::make_texture(DXGI_FORMAT format, uint32_t width, uint32_t height, D3D12_RESOURCE_STATES state,
+                                     D3D12_RESOURCE_FLAGS flags)
 {
     D3D12_HEAP_PROPERTIES heap = {};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -151,7 +152,7 @@ ID3D12Resource *passes::make_texture(DXGI_FORMAT format, uint32_t width, uint32_
     desc.MipLevels = 1;
     desc.Format = format;
     desc.SampleDesc.Count = 1;
-    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    desc.Flags = flags;
     ID3D12Resource *texture = nullptr;
     _device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr, IID_PPV_ARGS(&texture));
     return texture;
@@ -159,7 +160,8 @@ ID3D12Resource *passes::make_texture(DXGI_FORMAT format, uint32_t width, uint32_
 
 void passes::release_textures(uint64_t frame)
 {
-    for (ID3D12Resource **t : {&_color, &_motion, &_depth, &_downsampled, &_output, &_sharpened, &_presented})
+    for (ID3D12Resource **t : {&_color, &_motion, &_depth, &_downsampled, &_output, &_sharpened, &_presented,
+                               &_hudless})
     {
         if (*t != nullptr)
             _retired.push_back({*t, frame});
@@ -168,10 +170,11 @@ void passes::release_textures(uint64_t frame)
 }
 
 bool passes::resize(uint32_t width, uint32_t height, uint32_t output_width, uint32_t output_height,
-                    DXGI_FORMAT color_format, uint64_t frame)
+                    DXGI_FORMAT color_format, bool hudless, uint64_t frame)
 {
+    const bool own_hudless = hudless && output_width == width && output_height == height;
     if (_color != nullptr && width == _width && height == _height && output_width == _output_width &&
-        output_height == _output_height && color_format == _color_format)
+        output_height == _output_height && color_format == _color_format && own_hudless == (_hudless != nullptr))
         return true;
 
     release_textures(frame);
@@ -183,8 +186,8 @@ bool passes::resize(uint32_t width, uint32_t height, uint32_t output_width, uint
 
     const D3D12_RESOURCE_STATES uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     _color = make_texture(color_format, width, height, uav);
-    _motion = make_texture(DXGI_FORMAT_R16G16_FLOAT, width, height, uav);
-    _depth = make_texture(DXGI_FORMAT_R32_FLOAT, width, height, uav);
+    _motion = make_texture(DXGI_FORMAT_R16G16_FLOAT, width, height, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+    _depth = make_texture(DXGI_FORMAT_R32_FLOAT, width, height, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
     _output = make_texture(color_format, output_width, output_height, uav);
     _sharpened = make_texture(color_format, output_width, output_height, uav);
     bool ok = _color && _motion && _depth && _output && _sharpened;
@@ -196,6 +199,14 @@ bool passes::resize(uint32_t width, uint32_t height, uint32_t output_width, uint
     for (const auto &[texture, name] : names)
         if (texture != nullptr)
             texture->SetName(name);
+    if (own_hudless)
+    {
+        _hudless = make_texture(color_format, output_width, output_height, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
+                                D3D12_RESOURCE_FLAG_NONE);
+        ok = ok && _hudless;
+        if (_hudless != nullptr)
+            _hudless->SetName(L"ACV DLSS HUD-less image");
+    }
     if (upscaling())
     {
         _downsampled = make_texture(color_format, width, height, uav);
@@ -267,7 +278,7 @@ void passes::write_uav(D3D12_CPU_DESCRIPTOR_HANDLE at, ID3D12Resource *resource,
     _device->CreateUnorderedAccessView(resource, nullptr, &desc, at);
 }
 
-// One source in our color format, one target.
+// One source in our color format and one target.
 void passes::dispatch(ID3D12GraphicsCommandList *list, ID3D12PipelineState *pipeline, const void *constants,
                       uint32_t constant_count, ID3D12Resource *source, ID3D12Resource *target,
                       DXGI_FORMAT target_format, uint32_t width, uint32_t height)
@@ -293,6 +304,12 @@ void passes::dispatch(ID3D12GraphicsCommandList *list, ID3D12PipelineState *pipe
 void passes::prepare(ID3D12GraphicsCommandList *list, const game_texture &color, const game_texture &motion,
                      const game_texture &depth, const prepare_constants &constants)
 {
+    const D3D12_RESOURCE_BARRIER writable[] = {
+        transition(_motion, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+        transition(_depth, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+    };
+    list->ResourceBarrier(UINT(std::size(writable)), writable);
+
     D3D12_CPU_DESCRIPTOR_HANDLE cpu;
     const D3D12_GPU_DESCRIPTOR_HANDLE table = next_slot(cpu);
     write_srv(offset(cpu, 0), color.resource, color.format);
@@ -311,8 +328,8 @@ void passes::prepare(ID3D12GraphicsCommandList *list, const game_texture &color,
 
     const D3D12_RESOURCE_BARRIER barriers[] = {
         transition(_color, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-        transition(_motion, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-        transition(_depth, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        transition(_motion, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE),
+        transition(_depth, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE),
     };
     list->ResourceBarrier(UINT(std::size(barriers)), barriers);
 }
@@ -351,6 +368,8 @@ void passes::finish(ID3D12GraphicsCommandList *list, float sharpness, bool hdr, 
             constants.radial = *fx.radial;
         if (fx.lens)
             constants.lens = *fx.lens;
+        if (fx.doubling)
+            constants.doubling = *fx.doubling;
         const D3D12_RESOURCE_BARRIER readable =
             transition(result, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         list->ResourceBarrier(1, &readable);
@@ -364,6 +383,16 @@ void passes::finish(ID3D12GraphicsCommandList *list, float sharpness, bool hdr, 
 
     const D3D12_RESOURCE_BARRIER to_read = transition(result, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, READABLE);
     list->ResourceBarrier(1, &to_read);
+
+    if (_hudless != nullptr)
+    {
+        D3D12_RESOURCE_BARRIER b =
+            transition(_hudless, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->ResourceBarrier(1, &b);
+        list->CopyResource(_hudless, result);
+        std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+        list->ResourceBarrier(1, &b);
+    }
 
     // The TAA target is render size. Downsample when upscaling.
     ID3D12Resource *for_taa = result;
@@ -382,7 +411,7 @@ void passes::finish(ID3D12GraphicsCommandList *list, float sharpness, bool hdr, 
         for_taa = _downsampled;
     }
 
-    // The TAA draws into it, so it must be a render target again afterward.
+    // The TAA draws into it. It must be a render target again afterward.
     const D3D12_RESOURCE_BARRIER to_copy =
         transition(taa_target, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
     list->ResourceBarrier(1, &to_copy);
@@ -416,18 +445,16 @@ ID3D12Resource *passes::screen_image(float sharpness, const screen_fx &fx, uint3
 
 void passes::abandon(ID3D12GraphicsCommandList *list)
 {
-    const D3D12_RESOURCE_BARRIER writable[] = {
-        transition(_color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-        transition(_motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-        transition(_depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-    };
-    list->ResourceBarrier(UINT(std::size(writable)), writable);
+    // Motion and depth stay readable. prepare() makes them writable again.
+    const D3D12_RESOURCE_BARRIER writable =
+        transition(_color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    list->ResourceBarrier(1, &writable);
 }
 
 void passes::deliver(ID3D12GraphicsCommandList *list, ID3D12Resource *target, DXGI_FORMAT format, uint32_t width,
                      uint32_t height)
 {
-    // Samples by UV, so any size works. At 1:1 it's a format-converting copy.
+    // Samples by UV so any size works. At 1:1 it's a format-converting copy.
     dispatch(list, _downsample, nullptr, 0, _presented, target, format, width, height);
     D3D12_RESOURCE_BARRIER written = {};
     written.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;

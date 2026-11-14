@@ -3,10 +3,9 @@
 #include <string>
 #include <vector>
 
-// Keeps DLSS 5 out of our NGX startup. NGX sets up every feature it finds on
-// init, and a DLSS 5 already set up on our device crashed the next user of it
-// inside ReShade (RTX 50, official DLLs). Held open without sharing, the files
-// get skipped like an unsigned DLL.
+// Keeps DLSS 5 out of our NGX startup. NGX sets up every feature it finds on init. A DLSS 5 already set up
+// on our device crashed the next user of it inside ReShade (RTX 50, official DLLs). Files held open without
+// sharing get skipped like an unsigned DLL.
 class ngx_guard
 {
 public:

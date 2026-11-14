@@ -1,5 +1,4 @@
-// The game picks its jitter sequence with a switch on a setting (Steam build
-// 26142239, RVA 0xaa1f99):
+// The game picks its jitter sequence with a switch on a setting (Steam build 26142239, RVA 0xaa1f99):
 //
 //   48 8B C8                mov rcx, rax
 //   8B 05 ?? ?? ?? ??       mov eax, [rip + ...]
@@ -11,10 +10,9 @@
 //   8B 8C 8A <table RVA>    mov ecx, [rdx + rcx*4 + table]
 //   48 03 CA FF E1          add rcx, rdx ; jmp rcx
 //
-// Cases 1 to 4 mask the frame number with 3, 7, 15 and 31 and call the same
-// generator. The game always takes case 2. Pointing its entry at case 3 or 4
-// gives 16 or 32 positions from the game's own code, so the projection and TAA
-// constants stay in sync. Nothing is patched unless every case matches.
+// Cases 1 to 4 mask the frame number with 3, 7, 15 and 31 and call the same generator. The game always takes
+// case 2. Pointing its entry at case 3 or 4 gives 16 or 32 positions from the game's own code. The
+// projection and TAA constants stay in sync. Nothing is patched unless every case matches.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -24,6 +22,7 @@
 
 #include "jitter.h"
 #include "acvdlss.h"
+#include "scan.h"
 
 #ifdef ACVDLSS_PLAIN
 
@@ -38,7 +37,6 @@ uint32_t jitter_positions()
 
 #else
 
-#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -65,21 +63,6 @@ uint32_t g_case8 = 0, g_case16 = 0, g_case32 = 0; // RVAs of the three cases
 std::mutex g_write_lock;
 uint32_t g_positions = 0; // under g_write_lock
 
-// PAGE_EXECUTE alone isn't readable.
-bool readable_code(DWORD protect)
-{
-    return (protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0 &&
-           (protect & PAGE_GUARD) == 0;
-}
-
-bool matches(const uint8_t *p)
-{
-    for (size_t i = 0; i < SWITCH_SIZE; ++i)
-        if (SWITCH[i] >= 0 && p[i] != uint8_t(SWITCH[i]))
-            return false;
-    return true;
-}
-
 // and ebx, mask ; mov ecx, ebx ; call generator
 bool case_is(const uint8_t *base, uint32_t image_size, uint32_t rva, uint8_t mask, int32_t &call_target)
 {
@@ -100,35 +83,14 @@ void find()
     const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(base);
     const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS64 *>(base + dos->e_lfanew);
     const uint32_t image_size = nt->OptionalHeader.SizeOfImage;
-    uint8_t *const end = base + image_size;
 
-    uint8_t *found = nullptr;
     int count = 0;
-    MEMORY_BASIC_INFORMATION region;
-    for (uint8_t *at = base; at < end && VirtualQuery(at, &region, sizeof(region)) == sizeof(region);
-         at = static_cast<uint8_t *>(region.BaseAddress) + region.RegionSize)
-    {
-        if (region.State != MEM_COMMIT || !readable_code(region.Protect))
-            continue;
-        uint8_t *from = static_cast<uint8_t *>(region.BaseAddress);
-        uint8_t *to = std::min(from + region.RegionSize, end);
-        for (uint8_t *p = from; p + SWITCH_SIZE <= to; ++p)
-        {
-            p = static_cast<uint8_t *>(memchr(p, 0x48, size_t(to - p)));
-            if (p == nullptr || p + SWITCH_SIZE > to)
-                break;
-            if (matches(p))
-            {
-                found = p;
-                ++count;
-            }
-        }
-    }
-    if (count != 1)
+    uint8_t *found = scan_game_code(SWITCH, SWITCH_SIZE, count);
+    if (found == nullptr)
     {
         acv_log(reshade::log::level::warning,
-                count == 0 ? "jitter: the game's jitter code was not found in this build; it keeps its 8 positions"
-                           : "jitter: the game's jitter code was found more than once; it keeps its 8 positions");
+                count == 0 ? "jitter: the game's jitter code is not in this build. The game keeps its 8 positions"
+                           : "jitter: the game's jitter code was found more than once. The game keeps its 8 positions");
         return;
     }
 
@@ -146,7 +108,7 @@ void find()
     if (!ok)
     {
         acv_log(reshade::log::level::warning,
-                "jitter: the game's jitter code does not look as expected; it keeps its 8 positions");
+                "jitter: the game's jitter code does not look as expected. The game keeps its 8 positions");
         return;
     }
     g_case8 = table[2];
@@ -183,10 +145,10 @@ void write_case(uint32_t positions)
     if (!VirtualProtect(entry, sizeof(*entry), PAGE_EXECUTE_READWRITE, &old))
     {
         acv_log(reshade::log::level::warning,
-                "jitter: could not make the game's jump table writable; the game keeps its positions");
+                "jitter: could not make the game's jump table writable. The game keeps its positions");
         return;
     }
-    // Aligned 4-byte store, so game threads see either the old case or the new.
+    // Aligned 4-byte store. Game threads see either the old case or the new.
     reinterpret_cast<std::atomic<uint32_t> *>(entry)->store(target);
     VirtualProtect(entry, sizeof(*entry), old, &old);
     g_positions = positions;

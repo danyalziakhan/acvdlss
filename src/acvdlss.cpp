@@ -1,6 +1,6 @@
 // ACV DLSS
 //
-// Settings, toggle key and the overlay window. taa.cpp does the actual work.
+// Settings, toggle key and overlay window. taa.cpp does the work.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -10,6 +10,8 @@
 #include <reshade.hpp>
 
 #include "config.h"
+#include "effects.h"
+#include "frame_start.h"
 #include "jitter.h"
 #include "reflex.h"
 #include "acvdlss.h"
@@ -91,9 +93,12 @@ static void load_settings()
     g_settings.preset = read_preset();
     g_settings.sharpness = float(std::clamp(config_int("DLSS", "Sharpness", 0), 0, 100)) / 100.0f;
     g_settings.reflex = uint32_t(std::clamp(config_int("Latency", "Reflex", 1), 0, 2));
+    g_settings.reflex_placement = uint32_t(std::clamp(config_int("Latency", "ReflexPlacement", 2), 0, 2));
     g_settings.hudless = config_int("OptiScaler", "HudlessImage", 1) != 0;
     const int positions = config_int("Advanced", "JitterPositions", 0); // Auto reads as 0
     g_settings.jitter_positions = positions == 8 || positions == 16 || positions == 32 ? uint32_t(positions) : 0;
+    g_settings.vignette_mode = uint32_t(std::clamp(config_int("Image", "VignetteMethod", 0), 0, 1));
+    g_settings.vignette_strength = float(std::clamp(config_int("Image", "VignetteStrength", 100), 0, 200)) / 100.0f;
     g_settings.debug = config_int("Diagnostics", "Debug", 0) != 0;
 
     const int key = config_int("General", "ToggleKey", VK_F10);
@@ -110,14 +115,15 @@ static void log_settings()
     char positions[16] = "auto";
     if (g_settings.jitter_positions != 0)
         snprintf(positions, sizeof(positions), "%u", g_settings.jitter_positions.load());
-    char text[256];
+    char text[320];
     snprintf(text, sizeof(text),
-             "settings: %s, preset %s, sharpness %d%%, toggle key %s, Reflex %s, HUD-less image %s, jitter "
-             "positions %s%s",
+             "settings: %s, preset %s, sharpness %d%%, toggle key %s, Reflex %s, Reflex placement %u, HUD-less "
+             "image %s, jitter positions %s%s",
              g_settings.enabled ? "on" : "off", PRESETS[g_settings.preset],
              int(std::lround(g_settings.sharpness * 100.0f)),
              g_toggle_key != 0 ? key_name(g_toggle_key).c_str() : "none", REFLEX[g_settings.reflex],
-             g_settings.hudless ? "on" : "off", positions, g_settings.debug ? ", Debug on" : "");
+             g_settings.reflex_placement.load(), g_settings.hudless ? "on" : "off", positions,
+             g_settings.debug ? ", Debug on" : "");
     acv_log(reshade::log::level::info, text);
 }
 
@@ -234,7 +240,7 @@ static void draw_toggle_key(effect_runtime *runtime)
     ImGui::TextUnformatted("Toggle key");
     ImGui::SameLine();
     const std::string name = g_toggle_key != 0 ? key_name(g_toggle_key) : std::string("None");
-    const std::string label = (g_listening ? std::string("Press a key, Esc to cancel") : name) + "###toggle_key";
+    const std::string label = (g_listening ? std::string("Press a key or Esc to cancel") : name) + "###toggle_key";
     const int frame = ImGui::GetFrameCount();
     // Window closed while listening. Don't wait unseen.
     if (g_listening && frame != g_listen_frame + 1)
@@ -246,8 +252,8 @@ static void draw_toggle_key(effect_runtime *runtime)
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Switches DLSS on and off while playing.\nBackspace while picking leaves it without a key.");
 
-    // Windows reports every key as up while the overlay has input. Skip the
-    // first frame so the Space or Enter that pressed the button isn't taken.
+    // Windows reports every key as up while the overlay has input.
+    // Skip the first frame so the Space or Enter that pressed the button isn't taken.
     if (!g_listening || started || runtime == nullptr)
         return;
     // The left mouse button pressed the button.
@@ -325,7 +331,7 @@ static void draw_status(const taa_status &s)
     case taa_state::running:
         ImGui::Text("Running: %s.", describe_mode(s).c_str());
         if (s.camera_motion_only)
-            ImGui::TextDisabled("This scene has no motion vectors, so DLSS follows the camera alone.");
+            ImGui::TextDisabled("This scene has no motion vectors. DLSS follows the camera alone.");
         break;
     case taa_state::failed:
         ImGui::TextColored(WARNING_COLOR, "DLSS stopped: %s.", s.message.c_str());
@@ -378,7 +384,7 @@ static void draw_window(effect_runtime *runtime)
     if (ImGui::IsItemDeactivatedAfterEdit() && sharpness != dragged_from)
         log_change("sharpness set to %d%%", sharpness);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("AMD's RCAS, run on the DLSS output before the HUD is drawn.");
+        ImGui::SetTooltip("AMD's RCAS on the DLSS output. It runs before the HUD is drawn.");
 
     static const char *REFLEX[] = {"Off", "On", "On + Boost"};
     const char *no_reflex = reflex_unavailable();
@@ -394,9 +400,32 @@ static void draw_window(effect_runtime *runtime)
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
         ImGui::SetTooltip("%s", no_reflex != nullptr
                                     ? no_reflex
-                                    : "Cuts render queue latency, so input reaches the screen sooner.\n"
-                                      "Boost holds GPU clocks high when the CPU is the bottleneck, at some "
-                                      "power cost.");
+                                    : "Cuts render queue latency. Input reaches the screen sooner.\n"
+                                      "Boost keeps GPU clocks high when the CPU is the bottleneck. "
+                                      "It uses more power.");
+
+    static const char *VIGNETTES[] = {"Game's own", "Redrawn"};
+    int vignette = int(g_settings.vignette_mode.load());
+    if (ImGui::Combo("Vignette", &vignette, VIGNETTES, int(std::size(VIGNETTES))))
+    {
+        g_settings.vignette_mode = uint32_t(vignette);
+        config_set("Image", "VignetteMethod", vignette);
+        log_change("vignette set to %s", VIGNETTES[vignette]);
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Game's own: the game draws it before DLSS. It can smear at the edges.\n"
+                          "Redrawn: drawn again after DLSS to look like the game's own. It doesn't smear.");
+
+    int strength = int(std::lround(g_settings.vignette_strength.load() * 100.0f));
+    if (ImGui::SliderInt("Vignette strength", &strength, 0, 200, "%d%%", ImGuiSliderFlags_AlwaysClamp))
+        g_settings.vignette_strength = float(strength) / 100.0f;
+    if (ImGui::IsItemDeactivatedAfterEdit())
+    {
+        config_set("Image", "VignetteStrength", strength);
+        log_change("vignette strength set to %d%%", strength);
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("100%% is the game's own. 0%% turns the vignette off.");
 }
 
 // Every frame, overlay open or not.
@@ -420,11 +449,11 @@ static void on_overlay(effect_runtime *)
     }
     else if (s.state == taa_state::unavailable || s.state == taa_state::failed)
     {
-        text = "DLSS: Unavailable, see the ACV DLSS window";
+        text = "DLSS: Unavailable. See the ACV DLSS window";
     }
     else
     {
-        text = "DLSS: On, waiting for the game's anti-aliasing";
+        text = "DLSS: On. Waiting for the game's anti-aliasing";
     }
 
     ImGui::SetNextWindowPos(ImVec2(16.0f, 16.0f));
@@ -487,8 +516,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
     switch (reason)
     {
     case DLL_PROCESS_ATTACH:
-        // Must be the first ReShade call. reshade.hpp latches the module handle
-        // on first use and only register_addon passes it.
+        // Must be the first ReShade call.
+        // reshade.hpp latches the module handle on first use and only register_addon passes it.
         if (!reshade::register_addon(module))
             return FALSE;
         load_settings();
@@ -498,6 +527,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         lod_register();
         taa_register();
         reflex_register();
+        effects_register();
+        if (g_settings.reflex_placement != uint32_t(reflex_placement::after_present))
+            frame_start_hook();
         reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);
         reshade::register_event<reshade::addon_event::reshade_open_overlay>(on_open_overlay);
@@ -506,8 +538,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_overlay("ACV DLSS", draw_window);
         break;
     case DLL_PROCESS_DETACH:
-        // TAA first, so no frame can change the jitter after the restore.
+        // TAA first. Then no frame can change the jitter after the restore.
         taa_unregister();
+        effects_unregister();
         reflex_unregister();
         jitter_restore();
         reshade::unregister_addon(module);

@@ -29,14 +29,20 @@ struct lens_constants
     float c1[4], c2[4], c3[4];
 };
 
+struct double_image_constants
+{
+    float offset[2], amount, unused;
+};
+
 // Redone on DLSS's output.
 struct screen_fx
 {
-    float vignette = 0.0f; // 0 for none
+    float vignette = 0.0f; // strength, 0 for none
     std::optional<radial_constants> radial;
+    std::optional<double_image_constants> doubling;
     std::optional<lens_constants> lens;
 
-    bool any() const { return vignette > 0.0f || radial || lens; }
+    bool any() const { return vignette > 0.0f || radial || doubling || lens; }
 };
 
 // Must match the cbuffer order in screen_effects.hlsl.
@@ -46,6 +52,7 @@ struct screen_effect_constants
     float flags[4];
     radial_constants radial;
     lens_constants lens;
+    double_image_constants doubling; // amount 0 for off
 };
 static_assert(sizeof(screen_effect_constants) <= sizeof(prepare_constants), "too many root constants");
 
@@ -62,22 +69,23 @@ public:
     bool init(ID3D12Device *device);
     void shutdown();
 
-    // Old textures are kept until `frame` is far enough behind.
+    // hudless asks for that texture. Old textures are kept until `frame` is far enough behind.
     bool resize(uint32_t width, uint32_t height, uint32_t output_width, uint32_t output_height,
-                DXGI_FORMAT color_format, uint64_t frame);
+                DXGI_FORMAT color_format, bool hudless, uint64_t frame);
     void collect(uint64_t frame);
 
+    // Motion and depth stay readable by any shader until the next prepare(). ReShade effects read them.
     void prepare(ID3D12GraphicsCommandList *list, const game_texture &color, const game_texture &motion,
                  const game_texture &depth, const prepare_constants &constants);
 
-    // When upscaling, the full-size result goes to presented() and a
-    // downsampled copy to the TAA target for everything else.
+    // When upscaling the full-size result goes to presented().
+    // A downsampled copy goes to the TAA target for everything else.
     void finish(ID3D12GraphicsCommandList *list, float sharpness, bool hdr, const screen_fx &fx,
                 ID3D12Resource *taa_target);
     // For when DLSS didn't run. finish() calls it too.
     void abandon(ID3D12GraphicsCommandList *list);
 
-    // Fills an FSR 1 output, which must be in UAV state.
+    // Fills an FSR 1 output. It must be in UAV state.
     void deliver(ID3D12GraphicsCommandList *list, ID3D12Resource *target, DXGI_FORMAT format, uint32_t width,
                  uint32_t height);
 
@@ -89,13 +97,16 @@ public:
     ID3D12Resource *output() const { return _output; }
     // Readable by any shader between frames.
     ID3D12Resource *presented() const { return _presented; }
-    // What finish() produced, and its state afterward.
+    // The finished DLSS image. Readable by any shader between frames. Null unless asked for.
+    ID3D12Resource *hudless() const { return upscaling() ? _presented : _hudless; }
+    // What finish() produced and its state afterward.
     ID3D12Resource *screen_image(float sharpness, const screen_fx &fx, uint32_t &state) const;
     DXGI_FORMAT color_format() const { return _color_format; }
     const std::string &error() const { return _error; }
 
 private:
-    ID3D12Resource *make_texture(DXGI_FORMAT format, uint32_t width, uint32_t height, D3D12_RESOURCE_STATES state);
+    ID3D12Resource *make_texture(DXGI_FORMAT format, uint32_t width, uint32_t height, D3D12_RESOURCE_STATES state,
+                                 D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     void release_textures(uint64_t frame);
     D3D12_GPU_DESCRIPTOR_HANDLE next_slot(D3D12_CPU_DESCRIPTOR_HANDLE &cpu);
     D3D12_CPU_DESCRIPTOR_HANDLE offset(D3D12_CPU_DESCRIPTOR_HANDLE base, uint32_t index) const;
@@ -119,6 +130,7 @@ private:
     ID3D12Resource *_color = nullptr, *_motion = nullptr, *_depth = nullptr, *_downsampled = nullptr;
     // Output size.
     ID3D12Resource *_output = nullptr, *_sharpened = nullptr, *_presented = nullptr;
+    ID3D12Resource *_hudless = nullptr; // DLAA only. When upscaling _presented is the same image.
     uint32_t _width = 0, _height = 0, _output_width = 0, _output_height = 0;
     DXGI_FORMAT _color_format = DXGI_FORMAT_UNKNOWN;
 

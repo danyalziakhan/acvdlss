@@ -6,8 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # The NGX static library is built against the static runtime.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-# fxc ships with the Windows SDK. Outside a developer prompt, use the newest
-# SDK in the default install location.
+# fxc ships with the Windows SDK. Outside a developer prompt use the newest SDK in the default install location.
 file(GLOB SDK_BIN LIST_DIRECTORIES true "C:/Program Files (x86)/Windows Kits/10/bin/10.*/x64")
 list(SORT SDK_BIN)
 list(REVERSE SDK_BIN)
@@ -17,7 +16,8 @@ set(SHADER_HEADERS)
 set(SHADER_INCLUDES
     ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vignette.hlsl
     ${CMAKE_CURRENT_SOURCE_DIR}/shaders/radial.hlsl
-    ${CMAKE_CURRENT_SOURCE_DIR}/shaders/lens.hlsl)
+    ${CMAKE_CURRENT_SOURCE_DIR}/shaders/lens.hlsl
+    ${CMAKE_CURRENT_SOURCE_DIR}/shaders/double_image.hlsl)
 foreach(shader prepare rcas downsample screen_effects)
     set(header ${CMAKE_CURRENT_BINARY_DIR}/shaders/${shader}.h)
     add_custom_command(
@@ -28,8 +28,7 @@ foreach(shader prepare rcas downsample screen_effects)
     list(APPEND SHADER_HEADERS ${header})
 endforeach()
 
-# acvdlss.ini ships in the zip and is also embedded, so the add-on can write
-# it if missing. Same source file, so they can't drift.
+# acvdlss.ini is embedded so the add-on can write it when missing.
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/acvdlss.ini)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/acvdlss.ini DEFAULT_INI)
 file(CONFIGURE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/generated/default_ini.h
@@ -42,6 +41,9 @@ add_library(acvdlss SHARED
     src/taa.cpp
     src/jitter.cpp
     src/reflex.cpp
+    src/frame_start.cpp
+    src/effects.cpp
+    src/scan.cpp
     src/config.cpp
     src/ngx_guard.cpp
     src/dlss.cpp
@@ -61,9 +63,8 @@ target_link_libraries(acvdlss PRIVATE d3d12 dxgi shell32 ole32 version wintrust
     $<IF:$<CONFIG:Debug>,${NGX_LIB}/nvsdk_ngx_s_dbg.lib,${NGX_LIB}/nvsdk_ngx_s.lib>)
 target_compile_definitions(acvdlss PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
 
-# Leaves out the jitter patch (scans and patches game memory) and the
-# signature check. Smart App Control judges unknown unsigned DLLs by their
-# contents, and it blocked 0.4.
+# Leaves out the jitter patch (scans and patches game memory) and the signature check.
+# Smart App Control judges unknown unsigned DLLs by their contents. It can block a DLL that patches game memory.
 option(ACVDLSS_PLAIN "Leave out the jitter patch and the signature check" OFF)
 if(ACVDLSS_PLAIN)
     target_compile_definitions(acvdlss PRIVATE ACVDLSS_PLAIN)

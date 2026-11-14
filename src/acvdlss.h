@@ -10,6 +10,7 @@ namespace reshade::log
 }
 
 struct ID3D12Device;
+struct ID3D12Resource;
 
 namespace reshade::api
 {
@@ -33,11 +34,17 @@ struct settings
     std::atomic<float> sharpness{0.0f}; // 0..1, 0 skips RCAS
     std::atomic<uint32_t> reflex{1};    // reflex_mode
     // The rest are only in acvdlss.ini.
+    std::atomic<uint32_t> reflex_placement{2}; // reflex_placement, read at start
     // 0 picks from the upscaling ratio.
     std::atomic<uint32_t> jitter_positions{0};
     std::atomic<bool> debug{false};
     // HUD-less image for frame generation tools.
     std::atomic<bool> hudless{true};
+    // The game's vignette with DLSS. 0 the game's own: stays in DLSS's input and may smear. 1 redrawn:
+    // kept out of DLSS's input and drawn after it through the game's measured response. Strength is a
+    // factor on the game's. 0 is none.
+    std::atomic<uint32_t> vignette_mode{0};
+    std::atomic<float> vignette_strength{1.0f};
 };
 extern settings g_settings;
 
@@ -68,8 +75,16 @@ void taa_present(reshade::api::command_queue *queue, uint32_t display_width, uin
 // Drops DLSS history. The game's own TAA ran in between.
 void taa_restart();
 taa_status taa_get_status();
-// ReShade loads add-ons inside D3D12CreateDevice, before the game can build
-// pipelines. May clear the pipeline cache.
+// What effects.cpp hands to ReShade effects while DLSS replaced the TAA in one of the last few frames.
+// hudless may be null.
+struct shared_textures
+{
+    ID3D12Resource *motion = nullptr, *depth = nullptr, *hudless = nullptr;
+    uint32_t hudless_format = 0; // DXGI_FORMAT
+};
+bool taa_shared_textures(shared_textures &out);
+// ReShade loads add-ons inside D3D12CreateDevice before the game can build pipelines.
+// May clear the pipeline cache.
 void lod_register();
 void lod_frame(bool gameplay);
 // fsr_ratio is 1 with FSR off.

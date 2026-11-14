@@ -2,8 +2,7 @@
 
 #include <cstdint>
 
-// The game jitters through 8 positions. DLSS wants at least
-// 8 x (output / render)^2.
+// The game jitters through 8 positions. DLSS wants at least 8 x (output / render)^2.
 
 // Scans on a separate thread so loading isn't held up.
 void jitter_start();

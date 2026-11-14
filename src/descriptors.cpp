@@ -10,8 +10,7 @@ using namespace reshade::api;
 
 namespace
 {
-// Writes come in long runs and a copy touches two heaps. Four entries avoid
-// the locked lookup almost every time.
+// Writes come in long runs and a copy touches two heaps. Four entries avoid the locked lookup almost every time.
 struct heap_cache
 {
     struct line
@@ -159,8 +158,7 @@ bool descriptor_tracker::on_update(device *device, uint32_t count, const descrip
             entry *e = data->slot(offset + k);
             if (e == nullptr)
                 break;
-            // Handle before type, so a reader never pairs a new type with an
-            // old handle.
+            // Handle before type so a reader never pairs a new type with an old handle.
             switch (update.type)
             {
             case descriptor_type::sampler_with_resource_view:

@@ -1,5 +1,4 @@
-// acvdlss.log next to the game's exe. Flushed per line so a crash keeps
-// everything before it.
+// acvdlss.log next to the game's exe. Flushed per line so a crash keeps everything before it.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -83,8 +82,8 @@ static std::string acf_value(const std::string &text, const char *key)
     return end == std::string::npos ? std::string() : text.substr(at + 1, end - at - 1);
 }
 
-// The exe has no version resource. Steam copies get the build ID from the app
-// manifest. Others get the exe's date.
+// The exe has no version resource. Steam copies get the build ID from the app manifest.
+// Others get the exe's date.
 static std::string game_build()
 {
     wchar_t exe[MAX_PATH] = L"";
@@ -184,8 +183,8 @@ static std::string where(DWORD64 address)
     return text;
 }
 
-// The game's crash handler kills the process before anything reaches our log.
-// Games also raise and handle these on purpose. Hence the cap and the wording.
+// The game's crash handler kills the process before anything reaches our log. Games also raise and handle
+// these on purpose. Hence the cap and the wording.
 static LONG CALLBACK on_exception(EXCEPTION_POINTERS *info)
 {
     if (info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
@@ -197,7 +196,7 @@ static LONG CALLBACK on_exception(EXCEPTION_POINTERS *info)
     const ULONG_PTR *params = info->ExceptionRecord->ExceptionInformation;
     const char *access = params[0] == 0 ? "reading" : params[0] == 1 ? "writing" : "executing";
     char text[160];
-    snprintf(text, sizeof(text), "access violation %s 0x%llx at %s (if the game crashed, this is where)", access,
+    snprintf(text, sizeof(text), "access violation %s 0x%llx at %s (the crash site if the game crashed)", access,
              static_cast<unsigned long long>(params[1]), where(DWORD64(info->ExceptionRecord->ExceptionAddress)).c_str());
     acv_log(reshade::log::level::error, text);
 
@@ -259,8 +258,7 @@ void log_adapter(ID3D12Device *device)
     acv_log(reshade::log::level::info, line.c_str());
 }
 
-// Most bug reports come down to another upscaler, an old nvngx_dlss.dll or a
-// second DLSS-NR.
+// Most bug reports come down to another upscaler, an old nvngx_dlss.dll or a second DLSS-NR.
 void log_modules()
 {
     const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());

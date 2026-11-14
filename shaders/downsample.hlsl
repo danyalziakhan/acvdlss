@@ -1,5 +1,5 @@
-// When upscaling, the TAA output is still render size. Next frame's
-// reflections and history read it, so fill it from the DLSS image.
+// When upscaling the TAA output is still render size.
+// Next frame's reflections and history read it. Fill it from the DLSS image.
 
 Texture2D<float4> source : register(t0);
 SamplerState linear_clamp : register(s0);

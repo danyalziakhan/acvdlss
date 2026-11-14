@@ -70,7 +70,7 @@ ngx_guard::ngx_guard(const std::wstring &game_folder)
     {
         char text[160];
         snprintf(text, sizeof(text),
-                 "kept %zu DLSS 5 (neural rendering) file%s out of ACV DLSS's own DLSS start-up, on purpose; other "
+                 "kept %zu DLSS 5 (neural rendering) file%s out of ACV DLSS's own DLSS start-up on purpose. Other "
                  "add-ons still load DLSS 5 for themselves",
                  _held.size(), _held.size() == 1 ? "" : "s");
         acv_log(reshade::log::level::info, text);
