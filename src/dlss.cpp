@@ -5,6 +5,7 @@
 #include "acvdlss.h"
 #include "ngx_guard.h"
 #include "dlss.h"
+#include "diag.h"
 
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
@@ -20,6 +21,51 @@
 #include <cwchar>
 #include <optional>
 #include <string>
+
+namespace
+{
+// Under Wine, DLSS reaches vkd3d-proton's CUDA interop (ID3D12DeviceExt GetCudaTextureObject and
+// GetCudaSurfaceObject). ReShade hooks those and decodes every CPU descriptor handle as one from its own wrapped
+// descriptor heaps. It finds its wrapper through this private-data tag on the device. NGX gets the real device,
+// so its heaps are not wrapped, and the decoded handle pointed nowhere: vkd3d-proton crashed reading it while
+// the DLSS feature was made. Without the tag the hook passes the handles on unchanged. So under Wine the tag is
+// taken off for the length of each DLSS call and put back after. Windows has no such calls and is not touched.
+const GUID RESHADE_DEVICE_TAG = {0x2523AFF4, 0x978B, 0x4939, {0xBA, 0x16, 0x8E, 0xE8, 0x76, 0xA4, 0xCB, 0x2A}};
+
+class reshade_tag_off
+{
+  public:
+    explicit reshade_tag_off(ID3D12Device *device)
+    {
+        static const bool wine = running_under_wine();
+        if (!wine || device == nullptr)
+            return;
+        UINT size = sizeof(_proxy);
+        if (FAILED(device->GetPrivateData(RESHADE_DEVICE_TAG, &size, &_proxy)) || size != sizeof(_proxy) ||
+            _proxy == nullptr || FAILED(device->SetPrivateData(RESHADE_DEVICE_TAG, 0, nullptr)))
+            return;
+        _device = device;
+        static bool logged = false;
+        if (!logged)
+        {
+            logged = true;
+            acv_log(reshade::log::level::info, "running under Wine: DLSS calls pass their descriptor handles to "
+                                               "vkd3d-proton unchanged");
+        }
+    }
+    ~reshade_tag_off()
+    {
+        if (_device != nullptr)
+            _device->SetPrivateData(RESHADE_DEVICE_TAG, sizeof(_proxy), &_proxy);
+    }
+    reshade_tag_off(const reshade_tag_off &) = delete;
+    reshade_tag_off &operator=(const reshade_tag_off &) = delete;
+
+  private:
+    ID3D12Device *_device = nullptr;
+    void *_proxy = nullptr;
+};
+} // namespace
 
 // NGX accepts any stable GUID as a project ID.
 static const char *PROJECT_ID = "5c3f9a1e-7b2d-4e8a-9f61-0d4c2b7e3a95";
@@ -128,8 +174,10 @@ bool dlss::init(ID3D12Device *device, bool log)
     CreateDirectoryW(data.c_str(), nullptr);
     // See ngx_guard.h. NGX may load features in both Init and GetCapabilityParameters.
     std::optional<ngx_guard> guard(std::in_place, folder);
+    std::optional<diag_stage> stage(std::in_place, "NGX start-up");
     NVSDK_NGX_Result result = NVSDK_NGX_D3D12_Init_with_ProjectID(
         PROJECT_ID, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0", data.c_str(), device, &info);
+    stage.reset();
     if (NVSDK_NGX_FAILED(result))
     {
         _error = result == NVSDK_NGX_Result_FAIL_FeatureNotSupported ? "this graphics card does not support DLSS"
@@ -138,7 +186,9 @@ bool dlss::init(ID3D12Device *device, bool log)
         return false;
     }
 
+    stage.emplace("reading DLSS capabilities");
     result = NVSDK_NGX_D3D12_GetCapabilityParameters(&_params);
+    stage.reset();
     guard.reset();
     if (NVSDK_NGX_FAILED(result))
     {
@@ -223,7 +273,10 @@ bool dlss::create(ID3D12GraphicsCommandList *list, const dlss_frame &frame)
     if (frame.hdr)
         create.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
 
+    diag_stage stage("making the DLSS feature");
+    std::optional<reshade_tag_off> untagged(std::in_place, _device);
     const NVSDK_NGX_Result result = NGX_D3D12_CREATE_DLSS_EXT(list, 1, 1, &_feature, _params, &create);
+    untagged.reset();
     if (NVSDK_NGX_FAILED(result))
     {
         _feature = nullptr;
@@ -286,7 +339,9 @@ bool dlss::evaluate(ID3D12GraphicsCommandList *list, const dlss_frame &frame)
     NVSDK_NGX_Parameter_SetD3d12Resource(_params, "Opti.Hudless", frame.hudless);
     NVSDK_NGX_Parameter_SetUI(_params, "Opti.Hudless.State", frame.hudless_state);
 
+    std::optional<reshade_tag_off> untagged(std::in_place, _device);
     const NVSDK_NGX_Result result = NGX_D3D12_EVALUATE_DLSS_EXT(list, _feature, _params, &eval);
+    untagged.reset();
     if (NVSDK_NGX_FAILED(result))
     {
         _error = describe("Running DLSS", result);

@@ -39,6 +39,7 @@ set(NGX_LIB ${CMAKE_CURRENT_SOURCE_DIR}/deps/dlss/lib/Windows_x86_64/x64)
 add_library(acvdlss SHARED
     src/acvdlss.cpp
     src/taa.cpp
+    src/diag.cpp
     src/jitter.cpp
     src/reflex.cpp
     src/frame_start.cpp

@@ -15,6 +15,7 @@
 #include "jitter.h"
 #include "reflex.h"
 #include "acvdlss.h"
+#include "diag.h"
 
 #include <algorithm>
 #include <chrono>
@@ -84,6 +85,39 @@ static uint32_t read_preset()
     if (value[1] == '\0' && letter >= 'A' && letter < char('A' + std::size(PRESETS) - 1))
         return uint32_t(letter - 'A' + 1);
     return 0;
+}
+
+// ReShade's Generic Depth add-on copies the game's depth buffer on ReShade's own command list before effects,
+// every frame, whether or not an effect uses it. During a fast travel or a load the game reuses that memory while
+// the buffer still exists. The copy then faulted the GPU and the game closed, even with no other add-on. With
+// copies before clear operations at full (2), it copies on the game's own command lists instead, while the
+// buffer is valid. It reads the setting when the device is made, after add-ons load. So it is set here when
+// Generic Depth is on. None of our features need it, so turning it off works as well.
+static void guard_generic_depth()
+{
+    char disabled[2048] = {};
+    size_t size = sizeof(disabled) - 1;
+    if (reshade::get_config_value(nullptr, "ADDON", "DisabledAddons", disabled, &size))
+    {
+        // A list comes back as names separated by null characters.
+        for (size_t at = 0; at < size && disabled[at] != '\0';)
+        {
+            const std::string name(disabled + at);
+            if (name == "Generic Depth" || name.rfind("Generic Depth@", 0) == 0)
+                return;
+            at += name.size() + 1;
+        }
+    }
+    int mode = 0;
+    if (reshade::get_config_value(nullptr, "DEPTH", "DepthCopyBeforeClears", mode) && mode == 2)
+        return;
+    reshade::set_config_value(nullptr, "DEPTH", "DepthCopyBeforeClears", 2);
+    char text[256];
+    snprintf(text, sizeof(text),
+             "ReShade's Generic Depth add-on is on: set its copy before clear operations to full (was %d). Its "
+             "default crashed the game on fast travel. Turning Generic Depth off works as well",
+             mode);
+    acv_log(reshade::log::level::warning, text);
 }
 
 static void load_settings()
@@ -509,9 +543,11 @@ static void on_present(effect_runtime *runtime)
     if (runtime == g_runtime && !g_overlay_open && toggle_key_pressed())
         set_enabled(!g_settings.enabled, "the toggle key");
     taa_present(runtime->get_command_queue(), width, height);
+    if (runtime == g_runtime)
+        diag_present(reinterpret_cast<ID3D12Device *>(runtime->get_device()->get_native()));
 }
 
-BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 {
     switch (reason)
     {
@@ -523,6 +559,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         load_settings();
         log_start();
         log_settings();
+        guard_generic_depth();
+        diag_start();
         jitter_start();
         lod_register();
         taa_register();
@@ -538,6 +576,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_overlay("ACV DLSS", draw_window);
         break;
     case DLL_PROCESS_DETACH:
+        // reserved is set when the whole game is closing.
+        diag_stop(reserved != nullptr);
         // TAA first. Then no frame can change the jitter after the restore.
         taa_unregister();
         effects_unregister();

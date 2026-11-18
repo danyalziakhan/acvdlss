@@ -240,6 +240,13 @@ resolution (for DLSS or resolution scaling)**. `ACVDLSS_DEPTH` needs no setup.
 - ACV DLSS writes `acvdlss.log` next to `ACValhalla.exe`. It starts fresh each
   time the game starts. Attach it together with `acvdlss.ini` when you report a
   problem. Its warnings also appear in ReShade's log.
+- ReShade's **Generic Depth** add-on can crash the game on a fast travel or a
+  loading screen. Neither DLSS nor the ACV DLSS effects need it. Turn it off in
+  the **Add-ons** tab unless an effect you use needs ReShade's depth. If it
+  stays on, ACV DLSS changes one of its settings to stop the crash.
+- If the game hangs or crashes, set `Debug=1` under `[Diagnostics]` in
+  `acvdlss.ini` and start it again. The log then shows each start-up step and
+  where the game got stuck.
 
 ## With RenoDX DLSS
 

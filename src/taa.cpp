@@ -10,6 +10,7 @@
 #include <dxgi1_4.h>
 
 #include "acvdlss.h"
+#include "diag.h"
 #include "descriptors.h"
 #include "effects.h"
 #include "jitter.h"
@@ -277,6 +278,8 @@ struct context
     dlss upscaler;
     passes work;
     bool ready = false;
+    // Under Wine DLSS starts at the first frame instead of in init_device (see start_dlss).
+    bool deferred = false;
     std::string error;
 
     // The TAA pass is recorded on whichever thread the game picks.
@@ -353,7 +356,7 @@ const char *const PROBE_NAMES[P_COUNT] = {
     "pipeline binds",
 };
 
-// The work takes well under 1 us. A call this long was probably waiting on a lock.
+// The work takes well under 1 us. A call this long waited on a lock.
 const uint64_t LONG_CALL_NS = 500'000;
 
 struct probe_total
@@ -1623,6 +1626,34 @@ bool replace(command_list *cmd, list_state &st)
 
 //----------------------------------------------------------------------------
 
+// NGX, our shaders and the status. Called with the context's locks held or before it is shared.
+void start_dlss(context &c, ID3D12Device *native)
+{
+    if (!c.upscaler.init(native, g_settings.debug))
+        c.error = c.upscaler.error();
+    else
+    {
+        diag_stage stage("making our shaders");
+        if (!c.work.init(native))
+            c.error = c.work.error();
+        else
+            c.ready = true;
+    }
+    // After NGX init so its modules show up too.
+    log_modules();
+
+    if (c.ready)
+    {
+        set_status(c, taa_state::waiting);
+        acv_log(reshade::log::level::info, "DLSS is ready. Waiting for the game's TAA pass");
+    }
+    else
+    {
+        set_status(c, taa_state::unavailable, c.error);
+        acv_log(reshade::log::level::warning, ("DLSS can't start: " + c.error).c_str());
+    }
+}
+
 void on_init_device(device *dev)
 {
     if (dev->get_api() != device_api::d3d12)
@@ -1633,31 +1664,28 @@ void on_init_device(device *dev)
     auto c = std::make_unique<context>();
     c->dev = dev;
     auto *native = reinterpret_cast<ID3D12Device *>(dev->get_native());
-    log_adapter(native);
-    if (!c->upscaler.init(native, g_settings.debug))
-        c->error = c->upscaler.error();
-    else if (!c->work.init(native))
-        c->error = c->work.error();
-    else
-        c->ready = true;
-    // After NGX init so its modules show up too.
-    log_modules();
-
-    if (c->ready)
+    diag_device_created();
     {
+        diag_stage stage("reading the GPU");
+        log_adapter(native);
+    }
+    // Under Wine, vkd3d-proton is still inside D3D12CreateDevice here. DLSS calls NVAPI on the device while it
+    // starts, and that call waited forever on a lock in vkd3d-proton (Proton, RTX 4080 SUPER). Native Linux
+    // games start DLSS after the device exists, so wait for the first frame there. Windows keeps the start here.
+    if (running_under_wine())
+    {
+        c->deferred = true;
         set_status(*c, taa_state::waiting);
-        acv_log(reshade::log::level::info, "DLSS is ready. Waiting for the game's TAA pass");
+        acv_log(reshade::log::level::info, "running under Wine: DLSS starts at the first frame");
     }
     else
-    {
-        set_status(*c, taa_state::unavailable, c->error);
-        acv_log(reshade::log::level::warning, ("DLSS can't start: " + c->error).c_str());
-    }
+        start_dlss(*c, native);
     g_ctx = std::move(c);
 }
 
 void on_destroy_device(device *dev)
 {
+    diag_device_destroyed();
     std::lock_guard lock(g_ctx_lock);
     if (g_ctx == nullptr || g_ctx->dev != dev)
         return;
@@ -2415,6 +2443,11 @@ static bool present_frame(command_queue *queue, uint32_t display_width, uint32_t
     if (c.frame > c.last_replaced)
         stop_upscaling();
     ++c.frame;
+    if (c.deferred)
+    {
+        c.deferred = false;
+        start_dlss(c, reinterpret_cast<ID3D12Device *>(c.dev->get_native()));
+    }
     c.work.collect(c.frame);
     check_device(c);
     if (g_settings.debug)
@@ -2449,6 +2482,17 @@ void taa_restart()
         return;
     std::lock_guard lock(g_ctx->lock);
     g_ctx->force_reset = true;
+}
+
+bool taa_ran_this_frame()
+{
+    std::lock_guard ctx_lock(g_ctx_lock);
+    if (g_ctx == nullptr)
+        return false;
+    std::lock_guard lock(g_ctx->lock);
+    // The frame counter moves on at present, after the effects. So during this frame's effects both values are
+    // this frame's if the pass ran.
+    return g_ctx->last_replaced != 0 && g_ctx->last_replaced == g_ctx->frame;
 }
 
 bool taa_shared_textures(shared_textures &out)

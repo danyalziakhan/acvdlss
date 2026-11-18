@@ -29,6 +29,8 @@ const char PREFIX[] = "ACV DLSS: ";
 std::mutex g_lock;
 FILE *g_file = nullptr;
 bool g_opened = false;
+// Set while this thread walks another thread's stack. A fault there is expected and not the game's.
+thread_local bool t_walking = false;
 
 FILE *log_file()
 {
@@ -57,6 +59,41 @@ std::string file_version(const std::wstring &path)
     snprintf(text, sizeof(text), "%u.%u.%u", HIWORD(info->dwFileVersionMS), LOWORD(info->dwFileVersionMS),
              HIWORD(info->dwFileVersionLS));
     return text;
+}
+
+// The file's description, or its product name, or empty. Wine's own DLLs and vkd3d-proton name themselves
+// there.
+static std::string file_description(const std::wstring &path)
+{
+    DWORD unused = 0;
+    const DWORD size = GetFileVersionInfoSizeW(path.c_str(), &unused);
+    if (size == 0)
+        return {};
+    std::string data(size, '\0');
+    struct translation
+    {
+        WORD language, code_page;
+    } *list = nullptr;
+    UINT length = 0;
+    if (!GetFileVersionInfoW(path.c_str(), 0, size, data.data()) ||
+        !VerQueryValueW(data.data(), L"\\VarFileInfo\\Translation", reinterpret_cast<void **>(&list), &length) ||
+        list == nullptr || length < sizeof(translation))
+        return {};
+    for (const wchar_t *field : {L"FileDescription", L"ProductName"})
+    {
+        wchar_t key[96];
+        swprintf(key, std::size(key), L"\\StringFileInfo\\%04x%04x\\%ls", list->language, list->code_page, field);
+        wchar_t *value = nullptr;
+        if (VerQueryValueW(data.data(), key, reinterpret_cast<void **>(&value), &length) && value != nullptr &&
+            length > 1)
+        {
+            const int n = WideCharToMultiByte(CP_UTF8, 0, value, -1, nullptr, 0, nullptr, nullptr);
+            std::string text(size_t(n > 0 ? n - 1 : 0), '\0');
+            WideCharToMultiByte(CP_UTF8, 0, value, -1, text.data(), n, nullptr, nullptr);
+            return text;
+        }
+    }
+    return {};
 }
 
 static std::string module_path(HMODULE module)
@@ -129,6 +166,49 @@ static std::string game_build()
     return text;
 }
 
+// The Windows version. Under Wine or Proton also the Wine version, the host and the settings that decide DLSS.
+static void log_system()
+{
+    const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    // GetVersionEx reports an older Windows to programs without a manifest.
+    using get_version = LONG(WINAPI *)(OSVERSIONINFOW *);
+    OSVERSIONINFOW version = {sizeof(version)};
+    if (auto get = reinterpret_cast<get_version>(GetProcAddress(ntdll, "RtlGetVersion")))
+        get(&version);
+    char text[256];
+    snprintf(text, sizeof(text), "system: Windows %lu.%lu build %lu", version.dwMajorVersion, version.dwMinorVersion,
+             version.dwBuildNumber);
+    std::string line = text;
+
+    using wine_version = const char *(CDECL *)();
+    using wine_host = void(CDECL *)(const char **system, const char **release);
+    const auto wine = reinterpret_cast<wine_version>(GetProcAddress(ntdll, "wine_get_version"));
+    if (wine != nullptr)
+    {
+        line += std::string(" under Wine ") + wine();
+        const char *system = nullptr, *release = nullptr;
+        if (auto host = reinterpret_cast<wine_host>(GetProcAddress(ntdll, "wine_get_host_version")))
+            host(&system, &release);
+        if (system != nullptr)
+            line += std::string(" on ") + system + (release != nullptr ? std::string(" ") + release : "");
+    }
+    acv_log(reshade::log::level::info, line.c_str());
+    if (wine == nullptr)
+        return;
+
+    line = "Wine settings:";
+    for (const char *name : {"PROTON_ENABLE_NVAPI", "DXVK_ENABLE_NVAPI", "PROTON_HIDE_NVIDIA_GPU",
+                             "PROTON_ENABLE_NGX_UPDATER", "DXVK_NVAPI_DRIVER_VERSION", "DXVK_NVAPI_ALLOW_OTHER_DRIVERS",
+                             "VKD3D_CONFIG", "VKD3D_FEATURE_LEVEL", "WINEDLLOVERRIDES", "SteamDeck"})
+    {
+        char value[256] = "";
+        if (GetEnvironmentVariableA(name, value, DWORD(std::size(value))) > 0)
+            line += std::string(" ") + name + "=" + value;
+    }
+    acv_log(reshade::log::level::info,
+            line == "Wine settings:" ? "Wine settings: none of the known ones set" : line.c_str());
+}
+
 void log_start()
 {
     HMODULE self = nullptr;
@@ -145,6 +225,7 @@ void log_start()
                        module_path(nullptr);
     acv_log(reshade::log::level::info, text.c_str());
     AddVectoredExceptionHandler(0, on_exception);
+    log_system();
 
     wchar_t documents[MAX_PATH] = L"";
     if (SHGetFolderPathW(nullptr, CSIDL_PERSONAL, nullptr, SHGFP_TYPE_CURRENT, documents) != S_OK)
@@ -183,42 +264,114 @@ static std::string where(DWORD64 address)
     return text;
 }
 
+// Return addresses up the stack from a context. Stops at a fault, which a running thread's stack can cause.
+static int walk(const CONTEXT *start, DWORD64 *out, int max)
+{
+    CONTEXT context = *start;
+    int n = 0;
+    __try
+    {
+        while (n < max && context.Rip != 0)
+        {
+            out[n++] = context.Rip;
+            DWORD64 image = 0;
+            PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context.Rip, &image, nullptr);
+            if (function == nullptr)
+            {
+                // Leaf function. The return address is on top of the stack.
+                context.Rip = *reinterpret_cast<const DWORD64 *>(context.Rsp);
+                context.Rsp += 8;
+                continue;
+            }
+            void *handler_data = nullptr;
+            DWORD64 frame = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, context.Rip, function, &context, &handler_data, &frame,
+                             nullptr);
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+    return n;
+}
+
+static std::string stack_text(const CONTEXT *context)
+{
+    DWORD64 at[24];
+    t_walking = true;
+    const int n = walk(context, at, 24);
+    t_walking = false;
+    std::string text;
+    for (int i = 0; i < n; ++i)
+        text += " " + where(at[i]);
+    return text;
+}
+
+std::string thread_stack(unsigned long thread_id)
+{
+    if (thread_id == 0 || thread_id == GetCurrentThreadId())
+        return " (unknown)";
+    const HANDLE thread =
+        OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, thread_id);
+    if (thread == nullptr)
+        return " (the thread has ended)";
+    CONTEXT context = {};
+    context.ContextFlags = CONTEXT_FULL;
+    bool read = SuspendThread(thread) != DWORD(-1);
+    if (read)
+    {
+        read = GetThreadContext(thread, &context) != 0;
+        ResumeThread(thread);
+    }
+    CloseHandle(thread);
+    if (!read)
+        return " (could not be read)";
+    // Walked after the resume. A thread that is stuck keeps its stack. Nothing that may lock runs while the
+    // thread is suspended.
+    return stack_text(&context);
+}
+
+static const char *fatal_name(DWORD code)
+{
+    switch (code)
+    {
+    case EXCEPTION_ACCESS_VIOLATION: return "access violation";
+    case EXCEPTION_ILLEGAL_INSTRUCTION: return "illegal instruction";
+    case EXCEPTION_PRIV_INSTRUCTION: return "privileged instruction";
+    case EXCEPTION_STACK_OVERFLOW: return "stack overflow";
+    case EXCEPTION_INT_DIVIDE_BY_ZERO: return "division by zero";
+    case STATUS_HEAP_CORRUPTION: return "heap corruption";
+    default: return nullptr;
+    }
+}
+
 // The game's crash handler kills the process before anything reaches our log. Games also raise and handle
 // these on purpose. Hence the cap and the wording.
 static LONG CALLBACK on_exception(EXCEPTION_POINTERS *info)
 {
-    if (info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+    const DWORD code = info->ExceptionRecord->ExceptionCode;
+    const char *name = fatal_name(code);
+    if (name == nullptr || t_walking)
         return EXCEPTION_CONTINUE_SEARCH;
     static std::atomic<int> written{0};
     if (written++ >= 3)
         return EXCEPTION_CONTINUE_SEARCH;
 
-    const ULONG_PTR *params = info->ExceptionRecord->ExceptionInformation;
-    const char *access = params[0] == 0 ? "reading" : params[0] == 1 ? "writing" : "executing";
-    char text[160];
-    snprintf(text, sizeof(text), "access violation %s 0x%llx at %s (the crash site if the game crashed)", access,
-             static_cast<unsigned long long>(params[1]), where(DWORD64(info->ExceptionRecord->ExceptionAddress)).c_str());
-    acv_log(reshade::log::level::error, text);
-
-    CONTEXT context = *info->ContextRecord;
-    std::string stack = "call stack:";
-    for (int i = 0; i < 24 && context.Rip != 0; ++i)
+    char text[192];
+    const std::string site = where(DWORD64(info->ExceptionRecord->ExceptionAddress));
+    if (code == EXCEPTION_ACCESS_VIOLATION)
     {
-        stack += " " + where(context.Rip);
-        DWORD64 image = 0;
-        PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context.Rip, &image, nullptr);
-        if (function == nullptr)
-        {
-            // Leaf function. The return address is on top of the stack.
-            context.Rip = *reinterpret_cast<const DWORD64 *>(context.Rsp);
-            context.Rsp += 8;
-            continue;
-        }
-        void *handler_data = nullptr;
-        DWORD64 frame = 0;
-        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, context.Rip, function, &context, &handler_data, &frame, nullptr);
+        const ULONG_PTR *params = info->ExceptionRecord->ExceptionInformation;
+        const char *access = params[0] == 0 ? "reading" : params[0] == 1 ? "writing" : "executing";
+        snprintf(text, sizeof(text), "access violation %s 0x%llx at %s (the crash site if the game crashed)",
+                 access, static_cast<unsigned long long>(params[1]), site.c_str());
     }
-    acv_log(reshade::log::level::error, stack.c_str());
+    else
+        snprintf(text, sizeof(text), "%s at %s (the crash site if the game crashed)", name, site.c_str());
+    acv_log(reshade::log::level::error, text);
+    // A stack overflow leaves no room to walk it.
+    if (code != EXCEPTION_STACK_OVERFLOW)
+        acv_log(reshade::log::level::error, ("call stack:" + stack_text(info->ContextRecord)).c_str());
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -256,6 +409,32 @@ void log_adapter(ID3D12Device *device)
         }
     }
     acv_log(reshade::log::level::info, line.c_str());
+
+    // What really runs D3D12 and NVAPI under ReShade: Windows' own, or vkd3d-proton and dxvk-nvapi under Wine.
+    // d3d12.dll and dxgi.dll by name would be ReShade's. Those come from the system folder.
+    wchar_t system[MAX_PATH] = L"";
+    GetSystemDirectoryW(system, MAX_PATH);
+    line = "runtime:";
+    for (const wchar_t *name : {L"d3d12.dll", L"d3d12core.dll", L"dxgi.dll", L"nvapi64.dll"})
+    {
+        std::wstring path = std::wstring(system) + L"\\" + name;
+        const bool proxied = wcscmp(name, L"d3d12.dll") == 0 || wcscmp(name, L"dxgi.dll") == 0;
+        if (HMODULE loaded = GetModuleHandleW(name); loaded != nullptr && !proxied)
+        {
+            wchar_t found[MAX_PATH] = L"";
+            GetModuleFileNameW(loaded, found, MAX_PATH);
+            path = found;
+        }
+        if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES)
+            continue;
+        const std::string version = file_version(path), description = file_description(path);
+        snprintf(text, sizeof(text), " %ls %s%s%s%s;", path.c_str(), version.empty() ? "no version" : version.c_str(),
+                 description.empty() ? "" : " (", description.c_str(), description.empty() ? "" : ")");
+        line += text;
+    }
+    if (line.back() == ';')
+        line.pop_back();
+    acv_log(reshade::log::level::info, line.c_str());
 }
 
 // Most bug reports come down to another upscaler, an old nvngx_dlss.dll or a second DLSS-NR.
@@ -267,7 +446,12 @@ void log_modules()
     std::wstring folder = game_folder();
     for (wchar_t &ch : folder)
         ch = wchar_t(towlower(ch));
-    std::string in_folder, elsewhere;
+    wchar_t windows_path[MAX_PATH] = L"";
+    GetWindowsDirectoryW(windows_path, MAX_PATH);
+    std::wstring windows = windows_path;
+    for (wchar_t &ch : windows)
+        ch = wchar_t(towlower(ch));
+    std::string in_folder, elsewhere, others;
     MODULEENTRY32W entry = {sizeof(entry)};
     for (BOOL more = Module32FirstW(snapshot, &entry); more; more = Module32NextW(snapshot, &entry))
     {
@@ -278,6 +462,16 @@ void log_modules()
         const std::wstring name = lower.substr(lower.find_last_of(L'\\') + 1);
         const bool ours = lower.compare(0, folder.size(), folder) == 0 && name != L"acvalhalla.exe";
         const bool ngx = name.find(L"nvngx") != std::wstring::npos;
+        // Overlays, recorders and other injected tools. Names only: their folders can carry a user name.
+        if (!ours && !ngx && lower.compare(0, windows.size(), windows) != 0)
+        {
+            const std::string version = file_version(path);
+            char item[MAX_PATH + 64];
+            snprintf(item, sizeof(item), "%s%ls%s%s", others.empty() ? "" : ", ", entry.szModule,
+                     version.empty() ? "" : " ", version.c_str());
+            others += item;
+            continue;
+        }
         if (!ours && !ngx)
             continue;
         const std::string version = file_version(path);
@@ -290,6 +484,28 @@ void log_modules()
     acv_log(reshade::log::level::info, ("loaded from the game folder: " + in_folder).c_str());
     if (!elsewhere.empty())
         acv_log(reshade::log::level::info, ("NGX modules elsewhere:" + elsewhere).c_str());
+    acv_log(reshade::log::level::info, ("other modules: " + (others.empty() ? std::string("none") : others)).c_str());
+}
+
+bool running_under_wine()
+{
+    return GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
+}
+
+void log_exit()
+{
+    // Other threads are gone at process exit. One may have died holding the lock.
+    if (!g_lock.try_lock())
+        return;
+    if (g_file != nullptr)
+    {
+        SYSTEMTIME now;
+        GetLocalTime(&now);
+        fprintf(g_file, "%02u:%02u:%02u:%03u [%5lu] | INFO  | the game is closing normally\n", now.wHour, now.wMinute,
+                now.wSecond, now.wMilliseconds, GetCurrentThreadId());
+        fflush(g_file);
+    }
+    g_lock.unlock();
 }
 
 std::wstring game_folder()

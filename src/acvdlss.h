@@ -26,6 +26,12 @@ std::string file_version(const std::wstring &path);
 void log_start();
 void log_adapter(ID3D12Device *device);
 void log_modules();
+// " a.dll+0x12 b.dll+0x34 ..." for another thread of the game, read while it is briefly suspended.
+std::string thread_stack(unsigned long thread_id);
+// The last line of a session that ended normally. Never blocks.
+void log_exit();
+// Wine or Proton (ntdll exports wine_get_version).
+bool running_under_wine();
 
 struct settings
 {
@@ -83,6 +89,8 @@ struct shared_textures
     uint32_t hudless_format = 0; // DXGI_FORMAT
 };
 bool taa_shared_textures(shared_textures &out);
+// True when DLSS replaced the TAA pass in the frame being drawn now. Some cutscenes skip the pass on some frames.
+bool taa_ran_this_frame();
 // ReShade loads add-ons inside D3D12CreateDevice before the game can build pipelines.
 // May clear the pipeline cache.
 void lod_register();

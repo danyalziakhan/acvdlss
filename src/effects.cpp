@@ -35,6 +35,11 @@ std::mutex g_lock;
 effect_runtime *g_runtime = nullptr;
 bound_texture g_motion, g_depth, g_hudless;
 resource g_placeholder = {0};
+// A view of the placeholder, made once. Bound in place of the HUD-less image in frames DLSS skipped, so
+// effects read the current screen instead of an older frame's image. Kept, so no view is made or destroyed
+// per frame when a cutscene skips frames back and forth.
+resource_view g_stale_view = {0};
+bool g_showing_stale = false;
 // Read by the DLSS pass on another thread.
 std::atomic<bool> g_hudless_used{false};
 
@@ -50,6 +55,8 @@ void release_all(device *dev)
     destroy_view(dev, g_motion.view);
     destroy_view(dev, g_depth.view);
     destroy_view(dev, g_hudless.view);
+    destroy_view(dev, g_stale_view);
+    g_showing_stale = false;
     if (g_placeholder.handle != 0)
         dev->destroy_resource(g_placeholder);
     g_placeholder = {0};
@@ -103,7 +110,7 @@ void on_reloaded_effects(effect_runtime *runtime)
     runtime->enumerate_texture_variables(nullptr, [&used](effect_runtime *rt, effect_texture_variable variable) {
         resource_view srv = {0};
         rt->get_texture_binding(variable, &srv, nullptr);
-        used |= srv.handle == g_hudless.view.handle;
+        used |= srv.handle == g_hudless.view.handle || (srv.handle != 0 && srv.handle == g_stale_view.handle);
     });
     if (used != g_hudless_used)
         acv_log(reshade::log::level::info, used ? "keeping the HUD-less image for an effect that reads it"
@@ -134,10 +141,43 @@ void on_present(effect_runtime *runtime)
     device *dev = runtime->get_device();
     bind(dev, MOTION, g_motion, motion, format::r16g16_float);
     bind(dev, DEPTH, g_depth, depth, format::r32_float);
+    const ID3D12Resource *const before = g_hudless.resource;
     if (shared.hudless != nullptr)
         bind(dev, HUDLESS, g_hudless, shared.hudless, format(shared.hudless_format));
     else
         bind(dev, HUDLESS, g_hudless, placeholder(dev), format::r8g8b8a8_unorm);
+    // A new binding replaced whatever on_begin_effects had swapped in.
+    if (g_hudless.resource != before)
+        g_showing_stale = false;
+}
+
+// Right before the effects of this frame. In a frame DLSS skipped, the HUD-less image is still an older frame's.
+// Mixed with the current screen it made moving figures jitter in a cutscene. Show the current screen instead.
+// In normal play DLSS runs every frame and nothing changes here.
+void on_begin_effects(effect_runtime *runtime, command_list *, resource_view, resource_view)
+{
+    std::lock_guard lock(g_lock);
+    if (runtime != g_runtime || g_hudless.view.handle == 0 ||
+        g_hudless.resource == reinterpret_cast<ID3D12Resource *>(g_placeholder.handle))
+        return;
+    const bool stale = !taa_ran_this_frame();
+    if (stale == g_showing_stale)
+        return;
+    device *dev = runtime->get_device();
+    if (stale && g_stale_view.handle == 0)
+    {
+        ID3D12Resource *const empty = placeholder(dev);
+        if (empty == nullptr ||
+            !dev->create_resource_view({reinterpret_cast<uint64_t>(empty)}, resource_usage::shader_resource,
+                                       resource_view_desc(format::r8g8b8a8_unorm), &g_stale_view))
+        {
+            g_stale_view = {0};
+            return;
+        }
+    }
+    const resource_view view = stale ? g_stale_view : g_hudless.view;
+    runtime->update_texture_bindings(HUDLESS, view, view);
+    g_showing_stale = stale;
 }
 } // namespace
 
@@ -146,12 +186,14 @@ void effects_register()
     reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
     reshade::register_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);
     reshade::register_event<reshade::addon_event::reshade_present>(on_present);
+    reshade::register_event<reshade::addon_event::reshade_begin_effects>(on_begin_effects);
     reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(on_reloaded_effects);
 }
 
 void effects_unregister()
 {
     reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(on_reloaded_effects);
+    reshade::unregister_event<reshade::addon_event::reshade_begin_effects>(on_begin_effects);
     reshade::unregister_event<reshade::addon_event::reshade_present>(on_present);
     reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);
     reshade::unregister_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
