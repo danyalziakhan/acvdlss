@@ -11,6 +11,7 @@
 
 #include "acvdlss.h"
 #include "diag.h"
+#include "fg_report.h"
 
 #include <reshade.hpp>
 
@@ -244,7 +245,10 @@ void diag_device_destroyed()
 void diag_present(ID3D12Device *device)
 {
     const uint64_t now = now_ms();
-    if (g_frames.fetch_add(1) == 0 && g_settings.debug)
+    const bool first = g_frames.fetch_add(1) == 0;
+    if (first)
+        fg_report_start();
+    if (first && g_settings.debug)
     {
         char text[96];
         snprintf(text, sizeof(text), "first frame %.1f s after the device was made",

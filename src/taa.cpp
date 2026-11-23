@@ -117,6 +117,9 @@ struct table_layout
     int32_t first_cbv = -1;
     // Table offset of the CBV at b0 of each space, 0 for a root CBV, -1 if absent.
     int32_t b0[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+    // Table offset of SRV register t0..t7 in spaces 0..3, -1 if absent (the exact vignette reads t4 of space 2).
+    int32_t srv[4][8] = {{-1, -1, -1, -1, -1, -1, -1, -1}, {-1, -1, -1, -1, -1, -1, -1, -1},
+                         {-1, -1, -1, -1, -1, -1, -1, -1}, {-1, -1, -1, -1, -1, -1, -1, -1}};
 };
 
 using layout_tables = std::vector<table_layout>;
@@ -614,6 +617,14 @@ struct texture_info
 };
 std::shared_mutex g_textures_lock;
 std::unordered_map<uint64_t, texture_info> g_textures;
+// Live 3D textures, for the same reason (the exact vignette's table).
+struct texture3d_info
+{
+    uint32_t width, height, depth;
+    format fmt;
+};
+std::mutex g_textures3d_lock;
+std::unordered_map<uint64_t, texture3d_info> g_textures3d;
 
 // May be stale. Compare it, never use it.
 uint64_t resource_at(device *dev, const descriptor_tracker &tracking, descriptor_table table, uint32_t binding)
@@ -1421,6 +1432,140 @@ void note_jitter(uint32_t width, uint32_t height, uint32_t output_width, float j
     }
 }
 
+buffer_range find_b0(device *dev, const root_state &root, uint32_t space);
+
+//----------------------------------------------------------------------------
+// The exact vignette: the game's grading table and the constants its tonemapping draw uses.
+// Read only: nothing is recorded in the game's tonemapping list. Our pass reads the table later, on the TAA list.
+
+struct tonemap_info
+{
+    float c[28] = {};              // b0 space 2, c0..c6, before take_out changes c0.x
+    ID3D12Resource *table = nullptr; // t4 of space 2, 32^3. Held with a reference while noted
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    uint64_t frame = 0;
+};
+
+std::mutex g_tonemap_lock;
+tonemap_info g_tonemap;
+// References we gave up, released once the GPU is surely done with them.
+std::vector<std::pair<ID3D12Resource *, uint64_t>> g_tonemap_retired;
+
+// Redrawn (exact) draws the vignette through the game's table.
+bool tonemap_wanted()
+{
+    return g_settings.vignette_mode.load() == 2;
+}
+
+resource_view srv_at(device *dev, const root_state &root, uint32_t space, uint32_t reg)
+{
+    if (root.tables == nullptr || space >= 4 || reg >= 8)
+        return {0};
+    const auto *tracking = descriptor_tracker::of(dev);
+    if (tracking == nullptr)
+        return {0};
+    for (uint32_t i = 0; i < uint32_t(root.params.size()) && i < root.tables->size(); ++i)
+    {
+        const int32_t at = (*root.tables)[i].srv[space][reg];
+        if (at < 0 || root.params[i].kind != root_kind::table)
+            continue;
+        descriptor_heap heap = {0};
+        uint32_t offset = 0;
+        dev->get_descriptor_heap_offset({root.params[i].value}, uint32_t(at), 0, &heap, &offset);
+        return tracking->view(heap, offset);
+    }
+    return {0};
+}
+
+// Swaps a held reference. Old ones wait 8 frames (the game queues at most three).
+void hold(ID3D12Resource *&slot, ID3D12Resource *next)
+{
+    if (slot == next)
+        return;
+    if (next != nullptr)
+        next->AddRef();
+    if (slot != nullptr)
+        g_tonemap_retired.push_back({slot, g_frames.load()});
+    slot = next;
+}
+
+void note_tonemap(device *dev, const list_state &st, const float *c28)
+{
+    tonemap_info t;
+    memcpy(t.c, c28, sizeof(t.c));
+    const resource_view view = srv_at(dev, st.graphics, 2, 4);
+    const resource res = view.handle != 0 ? dev->get_resource_from_view(view) : resource{0};
+    if (res.handle != 0)
+    {
+        // Only live 3D textures: querying a stale view's resource crashes.
+        texture3d_info info = {};
+        bool live = false;
+        {
+            std::lock_guard lock(g_textures3d_lock);
+            const auto it = g_textures3d.find(res.handle);
+            if (it != g_textures3d.end())
+            {
+                info = it->second;
+                live = true;
+            }
+        }
+        // The 32^3 table the shader's coordinate math assumes.
+        if (live && info.width == 32 && info.height == 32 && info.depth == 32)
+        {
+            const resource_view_desc vd = dev->get_resource_view_desc(view);
+            t.table = reinterpret_cast<ID3D12Resource *>(res.handle);
+            t.format = DXGI_FORMAT(vd.format != format::unknown ? vd.format : info.fmt);
+        }
+    }
+    t.frame = g_frames.load();
+
+    std::lock_guard lock(g_tonemap_lock);
+    hold(g_tonemap.table, t.table);
+    memcpy(g_tonemap.c, t.c, sizeof(t.c));
+    g_tonemap.format = t.format;
+    g_tonemap.frame = t.frame;
+}
+
+// Every frame. all: at device end, release everything now.
+void tonemap_collect(bool all)
+{
+    std::lock_guard lock(g_tonemap_lock);
+    if (all)
+    {
+        hold(g_tonemap.table, nullptr);
+        g_tonemap.frame = 0;
+    }
+    const uint64_t now = g_frames.load();
+    for (size_t i = 0; i < g_tonemap_retired.size();)
+    {
+        if (all || now >= g_tonemap_retired[i].second + 8)
+        {
+            g_tonemap_retired[i].first->Release();
+            g_tonemap_retired[i] = g_tonemap_retired.back();
+            g_tonemap_retired.pop_back();
+        }
+        else
+            ++i;
+    }
+    // Nobody asks any more: let the game's table go.
+    if (!all && g_tonemap.frame != 0 && !tonemap_wanted() && now > g_tonemap.frame + 2)
+    {
+        hold(g_tonemap.table, nullptr);
+        g_tonemap.frame = 0;
+    }
+}
+
+// The last tonemapping draw's values if seen in this frame or the two before. The reference stays held for at least
+// 8 frames after it is replaced, so the caller may record work on it now.
+bool take_tonemap(tonemap_info &out)
+{
+    std::lock_guard lock(g_tonemap_lock);
+    if (g_tonemap.frame == 0 || g_frames > g_tonemap.frame + 2)
+        return false;
+    out = g_tonemap;
+    return true;
+}
+
 bool replace(command_list *cmd, list_state &st)
 {
     context &c = *g_ctx;
@@ -1557,6 +1702,22 @@ bool replace(command_list *cmd, list_state &st)
     float values[16];
     if (take_values(g_vignette, values))
         fx.vignette = values[0] * g_settings.vignette_strength.load();
+    // Redrawn (exact): the vignette through the game's grading table. HDR keeps the fitted model.
+    tonemap_info tm;
+    if (g_settings.vignette_mode.load() == 2 && fx.vignette > 0.0f && !hdr && take_tonemap(tm) && tm.table != nullptr)
+    {
+        fx.lut = tm.table;
+        fx.lut_format = tm.format;
+        // c0.z is an integer flag (the game tests it with if_nz). As a float it is a denormal (1 reads as 1.4e-45),
+        // which a GPU float compare flushes to zero, so pass 1 or 0.
+        uint32_t table_on = 0;
+        memcpy(&table_on, &tm.c[2], sizeof(table_on));
+        fx.lut_on = table_on != 0 ? 1.0f : 0.0f;
+        fx.split = tm.c[24];
+        // The table pointer was noted at this frame's tonemapping draw. A pointer from an earlier frame can point at
+        // memory the game already reused. The GPU's table check rejects such a table (vignette_inverse_decide.hlsl).
+        fx.table_this_frame = tm.frame == g_frames.load();
+    }
     if (take_values(g_radial, values))
         fx.radial = make_radial(values);
     if (take_values(g_lens, values))
@@ -1651,6 +1812,8 @@ void start_dlss(context &c, ID3D12Device *native)
     {
         set_status(c, taa_state::unavailable, c.error);
         acv_log(reshade::log::level::warning, ("DLSS can't start: " + c.error).c_str());
+        if (running_under_wine())
+            log_wine_dlss_help();
     }
 }
 
@@ -1670,8 +1833,8 @@ void on_init_device(device *dev)
         log_adapter(native);
     }
     // Under Wine, vkd3d-proton is still inside D3D12CreateDevice here. DLSS calls NVAPI on the device while it
-    // starts, and that call waited forever on a lock in vkd3d-proton (Proton, RTX 4080 SUPER). Native Linux
-    // games start DLSS after the device exists, so wait for the first frame there. Windows keeps the start here.
+    // starts. That call waited forever on a lock in vkd3d-proton (Proton, RTX 4080 SUPER). Native Linux games
+    // start DLSS after the device exists. So under Wine it waits for the first frame. Windows keeps the start here.
     if (running_under_wine())
     {
         c->deferred = true;
@@ -1691,6 +1854,7 @@ void on_destroy_device(device *dev)
         return;
     if (g_ctx->queue != nullptr)
         g_ctx->queue->wait_idle();
+    tonemap_collect(true);
     g_ctx->work.shutdown();
     g_ctx->upscaler.shutdown();
     g_timer.shutdown();
@@ -1710,6 +1874,9 @@ table_layout describe_table(uint32_t count, const Range *ranges)
         if (range.type == descriptor_type::constant_buffer && range.dx_register_index == 0 &&
             range.dx_register_space < std::size(t.b0))
             t.b0[range.dx_register_space] = int32_t(range.binding);
+        if (range.type == descriptor_type::shader_resource_view && range.dx_register_space < 4)
+            for (uint32_t k = 0; k < range.count && range.dx_register_index + k < 8; ++k)
+                t.srv[range.dx_register_space][range.dx_register_index + k] = int32_t(range.binding + k);
         // Unbounded ranges report UINT32_MAX. Only the first slots are used.
         const uint32_t slots = std::min<uint32_t>(range.count, MAX_TABLE_TEXTURES);
         std::vector<uint32_t> *into = range.type == descriptor_type::shader_resource_view    ? &t.textures
@@ -1756,6 +1923,13 @@ void on_destroy_pipeline_layout(device *, pipeline_layout layout)
 
 void on_init_resource(device *dev, const resource_desc &desc, const subresource_data *, resource_usage, resource res)
 {
+    if (dev->get_api() == device_api::d3d12 && desc.type == resource_type::texture_3d)
+    {
+        std::lock_guard lock(g_textures3d_lock);
+        g_textures3d[res.handle] = {desc.texture.width, desc.texture.height, desc.texture.depth_or_layers,
+                                    desc.texture.format};
+        return;
+    }
     if (dev->get_api() != device_api::d3d12 || desc.type != resource_type::texture_2d)
         return;
     probe_scope probe(P_INIT_RESOURCE);
@@ -1784,6 +1958,10 @@ void forget_frame(uint64_t handle)
 void on_destroy_resource(device *, resource res)
 {
     probe_scope probe(P_DESTROY_RESOURCE);
+    {
+        std::lock_guard lock(g_textures3d_lock);
+        g_textures3d.erase(res.handle);
+    }
     {
         const uint64_t asked = g_settings.debug ? now_ns() : 0;
         std::unique_lock lock(g_textures_lock);
@@ -2004,12 +2182,20 @@ void take_out(screen_effect &e, command_list *cmd, const list_state &st)
     device *dev = cmd->get_device();
     const buffer_range range = find_b0(dev, st.graphics, e.space);
     void *data = nullptr;
+    // The exact vignette also wants c0..c6 of the tonemapping pass.
+    const bool note = &e == &g_vignette && tonemap_wanted();
     if (range.buffer.handle == 0 ||
-        !dev->map_buffer_region(range.buffer, range.offset, e.floats * 4, map_access::read_write, &data) ||
+        !dev->map_buffer_region(range.buffer, range.offset, (note ? 28 : e.floats) * 4, map_access::read_write, &data) ||
         data == nullptr)
         return;
     float values[16] = {};
     memcpy(values, data, e.floats * 4);
+    if (note)
+    {
+        float c28[28];
+        memcpy(c28, data, sizeof(c28));
+        note_tonemap(dev, st, c28);
+    }
     float neutral[16];
     memcpy(neutral, values, sizeof(neutral));
     if (&e == &g_vignette)
@@ -2473,6 +2659,7 @@ void taa_present(command_queue *queue, uint32_t display_width, uint32_t display_
 {
     // Outside the lock. It may write a file.
     lod_frame(present_frame(queue, display_width, display_height));
+    tonemap_collect(false);
 }
 
 void taa_restart()

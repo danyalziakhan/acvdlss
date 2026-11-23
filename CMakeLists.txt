@@ -17,13 +17,21 @@ set(SHADER_INCLUDES
     ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vignette.hlsl
     ${CMAKE_CURRENT_SOURCE_DIR}/shaders/radial.hlsl
     ${CMAKE_CURRENT_SOURCE_DIR}/shaders/lens.hlsl
-    ${CMAKE_CURRENT_SOURCE_DIR}/shaders/double_image.hlsl)
-foreach(shader prepare rcas downsample screen_effects)
+    ${CMAKE_CURRENT_SOURCE_DIR}/shaders/double_image.hlsl
+    ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vignette_exact.hlsl
+    ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vignette_cell.hlsl)
+foreach(shader prepare rcas downsample screen_effects vignette_inverse_clear vignette_inverse_scatter
+               vignette_inverse_resolve vignette_inverse_begin vignette_inverse_detect vignette_inverse_warm
+               vignette_inverse_decide vignette_inverse_commit)
     set(header ${CMAKE_CURRENT_BINARY_DIR}/shaders/${shader}.h)
+    set(extra_includes)
+    if(shader MATCHES "^vignette_inverse")
+        set(extra_includes ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vignette_inverse_state.hlsl)
+    endif()
     add_custom_command(
         OUTPUT ${header}
         COMMAND ${FXC} /nologo /T cs_5_0 /E main /O3 /Vn ${shader}_cs /Fh ${header} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${shader}.hlsl
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${shader}.hlsl ${SHADER_INCLUDES}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${shader}.hlsl ${SHADER_INCLUDES} ${extra_includes}
         COMMENT "Compiling ${shader}.hlsl")
     list(APPEND SHADER_HEADERS ${header})
 endforeach()
@@ -52,6 +60,7 @@ add_library(acvdlss SHARED
     src/lod.cpp
     src/log.cpp
     src/descriptors.cpp
+    src/fg_report.cpp
     src/acvdlss.rc
     ${SHADER_HEADERS})
 target_include_directories(acvdlss PRIVATE
@@ -60,7 +69,7 @@ target_include_directories(acvdlss PRIVATE
     deps/dlss/include
     ${CMAKE_CURRENT_BINARY_DIR}/shaders
     ${CMAKE_CURRENT_BINARY_DIR}/generated)
-target_link_libraries(acvdlss PRIVATE d3d12 dxgi shell32 ole32 version wintrust
+target_link_libraries(acvdlss PRIVATE d3d12 dxgi shell32 ole32 version wintrust crypt32
     $<IF:$<CONFIG:Debug>,${NGX_LIB}/nvsdk_ngx_s_dbg.lib,${NGX_LIB}/nvsdk_ngx_s.lib>)
 target_compile_definitions(acvdlss PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
 

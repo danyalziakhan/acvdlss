@@ -103,10 +103,19 @@ what DLSS is doing right now. With FSR on it also shows the LOD bias.
   ![The preset list open](nexus/2-presets.png)
 
 - **Sharpness** applies AMD's RCAS to the DLSS image before the HUD is drawn.
-- **Vignette** chooses how the game's vignette is drawn. **Game's own** is the
-  default. The game draws it before DLSS, where it can smear at the edges of
-  the screen. **Redrawn** draws it again after DLSS to look like the game's
-  own. It doesn't smear, but its colors can differ slightly in some scenes.
+- **Vignette** chooses how the game's vignette is drawn.
+  - **Game's own** is the default. The game draws it before DLSS, where it can
+    smear at the edges of the screen.
+  - **Redrawn (fast)** keeps it out of DLSS and draws it again after DLSS to
+    look like the game's own. It doesn't smear. Its colors can differ a little
+    in some scenes.
+  - **Redrawn (exact)** draws it again after DLSS through the game's own color
+    grading, so its colors follow the game's. It doesn't smear. In HDR it
+    works like Redrawn (fast).
+
+  Measured at 1920x1200 with DLAA, the add-on's work after DLSS took
+  0.045 ms a frame with Game's own, 0.44 ms with Redrawn (fast) and 0.68 to
+  0.70 ms with Redrawn (exact).
 - **Vignette strength** goes from 0 to 200% of the game's strength. 0% turns
   the vignette off.
 - **NVIDIA Reflex** is covered below.
@@ -174,7 +183,7 @@ Things to know:
 - **Reflex is switched off** while `FGOutput` is `fsrfg` or `xefg`. With FSR
   frame generation it hung the GPU in testing.
 - **If a loading screen freezes** with frame generation on, press **End** to
-  turn frame generation off before loading a save or fast travelling. Turn it
+  turn frame generation off before loading a save or fast traveling. Turn it
   back on once you're in. This happened a few times in testing.
 - **Disable RTSS for the game.** In RTSS, add `ACValhalla.exe` and set its
   **Application detection level** to **None**. OptiScaler warns about RTSS.
@@ -243,7 +252,8 @@ resolution (for DLSS or resolution scaling)**. `ACVDLSS_DEPTH` needs no setup.
 - ReShade's **Generic Depth** add-on can crash the game on a fast travel or a
   loading screen. Neither DLSS nor the ACV DLSS effects need it. Turn it off in
   the **Add-ons** tab unless an effect you use needs ReShade's depth. If it
-  stays on, ACV DLSS changes one of its settings to stop the crash.
+  stays on, ACV DLSS sets `DepthCopyBeforeClears=2` under `[DEPTH]` in
+  `ReShade.ini` to stop the crash.
 - If the game hangs or crashes, set `Debug=1` under `[Diagnostics]` in
   `acvdlss.ini` and start it again. The log then shows each start-up step and
   where the game got stuck.

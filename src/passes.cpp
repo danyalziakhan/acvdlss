@@ -4,8 +4,18 @@
 #include <prepare.h>
 #include <rcas.h>
 #include <screen_effects.h>
+#include <vignette_inverse_clear.h>
+#include <vignette_inverse_scatter.h>
+#include <vignette_inverse_resolve.h>
+#include <vignette_inverse_begin.h>
+#include <vignette_inverse_detect.h>
+#include <vignette_inverse_warm.h>
+#include <vignette_inverse_decide.h>
+#include <vignette_inverse_commit.h>
 
 #include <cstdio>
+#include <algorithm>
+#include <cstring>
 #include <iterator>
 #include <utility>
 
@@ -98,6 +108,16 @@ bool passes::init(ID3D12Device *device)
         {rcas_cs, sizeof(rcas_cs), &_rcas, "the sharpening pass"},
         {downsample_cs, sizeof(downsample_cs), &_downsample, "the downsample pass"},
         {screen_effects_cs, sizeof(screen_effects_cs), &_screen_effects, "the screen effects pass"},
+        {vignette_inverse_clear_cs, sizeof(vignette_inverse_clear_cs), &_inverse_clear, "the inverse table's clear"},
+        {vignette_inverse_scatter_cs, sizeof(vignette_inverse_scatter_cs), &_inverse_scatter,
+         "the inverse table's scatter"},
+        {vignette_inverse_resolve_cs, sizeof(vignette_inverse_resolve_cs), &_inverse_resolve,
+         "the inverse table's resolve"},
+        {vignette_inverse_begin_cs, sizeof(vignette_inverse_begin_cs), &_inverse_begin, "the change detector's start"},
+        {vignette_inverse_detect_cs, sizeof(vignette_inverse_detect_cs), &_inverse_detect, "the change detector"},
+        {vignette_inverse_warm_cs, sizeof(vignette_inverse_warm_cs), &_inverse_warm, "the inverse table's warm start"},
+        {vignette_inverse_decide_cs, sizeof(vignette_inverse_decide_cs), &_inverse_decide, "the table check"},
+        {vignette_inverse_commit_cs, sizeof(vignette_inverse_commit_cs), &_inverse_commit, "the table check's commit"},
     };
     for (const auto &shader : shaders)
     {
@@ -133,6 +153,17 @@ void passes::shutdown()
     release(_heap);
     release(_downsample);
     release(_screen_effects);
+    release(_inverse_clear);
+    release(_inverse_scatter);
+    release(_inverse_resolve);
+    release(_inverse_begin);
+    release(_inverse_detect);
+    release(_inverse_warm);
+    release(_inverse_decide);
+    release(_inverse_commit);
+    release(_inverse_state);
+    release(_inverse);
+    release(_inverse_keys);
     release(_rcas);
     release(_prepare);
     release(_root);
@@ -370,14 +401,61 @@ void passes::finish(ID3D12GraphicsCommandList *list, float sharpness, bool hdr, 
             constants.lens = *fx.lens;
         if (fx.doubling)
             constants.doubling = *fx.doubling;
+        // The exact vignette through the game's grading table The inverse table follows the
+        // game's table: a warm start when it changed a little, a full build when it moved further.
+        bool exact = fx.vignette > 0.0f && fx.lut != nullptr && !hdr;
+        if (exact)
+            exact = build_inverse(list, fx.lut, fx.lut_format, fx.table_this_frame);
+        if (exact)
+        {
+            // Interpolated start, 4 Newton steps, residual through the filter, fallback above 0.75/255.
+            constants.exact[0] = 1.0f;
+            constants.exact[1] = fx.lut_on;
+            constants.exact[2] = fx.split;
+            constants.exact[3] = 1.0f;
+            constants.exact_opts[0] = 0.0f;
+            constants.exact_opts[1] = 4.0f;
+            constants.exact_opts[2] = 0.75f / 255.0f;
+            constants.exact_opts[3] = 0.0f;
+            // Guard: ill-conditioned solutions (output amplification above 4, folds, a coordinate at the table's
+            // edge) take the fitted model. Y: the state texture is bound (table check, reject count).
+            constants.exact_guard[0] = 4.0f;
+            constants.exact_guard[1] = 1.0f;
+            constants.exact_guard[2] = 1.0f;
+            constants.exact_guard[3] = 1.0f;
+        }
         const D3D12_RESOURCE_BARRIER readable =
             transition(result, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         list->ResourceBarrier(1, &readable);
-        dispatch(list, _screen_effects, &constants, sizeof(constants) / 4, result, other, _color_format,
-                 _output_width, _output_height);
-        const D3D12_RESOURCE_BARRIER back =
-            transition(result, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        list->ResourceBarrier(1, &back);
+        {
+            // As dispatch(), with 3D views in slots 1 and 2 (null when not exact).
+            D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+            const D3D12_GPU_DESCRIPTOR_HANDLE table = next_slot(cpu);
+            write_srv(offset(cpu, 0), result, _color_format);
+            write_srv3d(offset(cpu, 1), exact ? fx.lut : nullptr, exact ? fx.lut_format : DXGI_FORMAT_R10G10B10A2_UNORM);
+            write_srv3d(offset(cpu, 2), exact ? _inverse : nullptr, DXGI_FORMAT_R32G32B32A32_FLOAT);
+            write_uav(offset(cpu, 3), other, _color_format);
+            {
+                // u1: the inverse build's state texture: the table check's result for this frame.
+                D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+                uav.Format = DXGI_FORMAT_R32_UINT;
+                uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+                uav.Texture3D.WSize = 193;
+                _device->CreateUnorderedAccessView(exact ? _inverse_state : nullptr, nullptr, &uav, offset(cpu, 4));
+            }
+            write_uav(offset(cpu, 5), nullptr, _color_format);
+            list->SetDescriptorHeaps(1, &_heap);
+            list->SetComputeRootSignature(_root);
+            list->SetPipelineState(_screen_effects);
+            list->SetComputeRoot32BitConstants(0, sizeof(constants) / 4, &constants, 0);
+            list->SetComputeRootDescriptorTable(1, table);
+            list->Dispatch((_output_width + 7) / 8, (_output_height + 7) / 8, 1);
+        }
+        D3D12_RESOURCE_BARRIER back[2] = {
+            transition(result, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            transition(_inverse, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+        };
+        list->ResourceBarrier(exact ? 2 : 1, back);
         result = other;
     }
 
@@ -460,4 +538,136 @@ void passes::deliver(ID3D12GraphicsCommandList *list, ID3D12Resource *target, DX
     written.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     written.UAV.pResource = target;
     list->ResourceBarrier(1, &written);
+}
+
+//----------------------------------------------------------------------------
+// The exact vignette's inverse table.
+
+void passes::write_srv3d(D3D12_CPU_DESCRIPTOR_HANDLE at, ID3D12Resource *resource, DXGI_FORMAT format)
+{
+    D3D12_SHADER_RESOURCE_VIEW_DESC desc = {};
+    desc.Format = format;
+    desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    desc.Texture3D.MipLevels = 1;
+    _device->CreateShaderResourceView(resource, &desc, at);
+}
+
+static const uint32_t INVERSE_SIZE = 33;
+// Largest change of the game's table since the last full build (10-bit steps) that still allows a warm start.
+static const uint32_t WARM_LIMIT = 32;
+
+bool passes::build_inverse(ID3D12GraphicsCommandList *list, ID3D12Resource *lut, DXGI_FORMAT lut_format,
+                           bool table_this_frame)
+{
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    desc.Width = desc.Height = INVERSE_SIZE;
+    desc.DepthOrArraySize = INVERSE_SIZE;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (_inverse == nullptr)
+    {
+        desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        _device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                         nullptr, IID_PPV_ARGS(&_inverse));
+        if (_inverse != nullptr)
+            _inverse->SetName(L"ACV DLSS exact vignette inverse table");
+        _inverse_force = true;
+    }
+    if (_inverse_keys == nullptr)
+    {
+        desc.Format = DXGI_FORMAT_R32_UINT;
+        _device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                         nullptr, IID_PPV_ARGS(&_inverse_keys));
+        if (_inverse_keys != nullptr)
+            _inverse_keys->SetName(L"ACV DLSS exact vignette inverse keys");
+        _inverse_force = true;
+    }
+    if (_inverse == nullptr || _inverse_keys == nullptr)
+        return false;
+    // The change detector: a bit copy of the game's table, counters, and the table of the last full build.
+    // Without it the inverse is built in full every frame.
+    if (_inverse_state == nullptr)
+    {
+        desc.Width = desc.Height = 32;
+        desc.DepthOrArraySize = 193;
+        desc.Format = DXGI_FORMAT_R32_UINT;
+        _device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                         nullptr, IID_PPV_ARGS(&_inverse_state));
+        if (_inverse_state != nullptr)
+            _inverse_state->SetName(L"ACV DLSS exact vignette change detector");
+        _inverse_force = true;
+    }
+    const bool detector = _inverse_state != nullptr;
+    // x: full build regardless (new textures). y: the detector runs. z: warm start. w: bit 1 the table was noted
+    // this frame, bits 8..: the warm start's limit.
+    const uint32_t constants[4] = {_inverse_force ? 1u : 0u, detector ? 1u : 0u, detector ? 1u : 0u,
+                                   (table_this_frame ? 2u : 0u) | (WARM_LIMIT << 8)};
+    _inverse_force = false;
+
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+    const D3D12_GPU_DESCRIPTOR_HANDLE table = next_slot(cpu);
+    write_srv3d(offset(cpu, 0), lut, lut_format);
+    write_srv(offset(cpu, 1), nullptr, _color_format);
+    write_srv(offset(cpu, 2), nullptr, _color_format);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+    uav.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+    uav.Texture3D.WSize = INVERSE_SIZE;
+    _device->CreateUnorderedAccessView(_inverse, nullptr, &uav, offset(cpu, 3));
+    uav.Format = DXGI_FORMAT_R32_UINT;
+    _device->CreateUnorderedAccessView(_inverse_keys, nullptr, &uav, offset(cpu, 4));
+    uav.Texture3D.WSize = 193;
+    _device->CreateUnorderedAccessView(_inverse_state, nullptr, &uav, offset(cpu, 5));
+    list->SetDescriptorHeaps(1, &_heap);
+    list->SetComputeRootSignature(_root);
+    list->SetComputeRoot32BitConstants(0, 4, constants, 0);
+    list->SetComputeRootDescriptorTable(1, table);
+    D3D12_RESOURCE_BARRIER uav_barrier = {};
+    uav_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; // all UAVs
+    const UINT groups = (INVERSE_SIZE + 3) / 4;
+    if (detector)
+    {
+        // Flag = force, then any texel that differs from the copy raises it. Every later pass returns at once when
+        // the table is unchanged (vignette_inverse_state.hlsl).
+        list->SetPipelineState(_inverse_begin);
+        list->Dispatch(1, 1, 1);
+        list->ResourceBarrier(1, &uav_barrier);
+        list->SetPipelineState(_inverse_detect);
+        list->Dispatch(8, 8, 8);
+        list->ResourceBarrier(1, &uav_barrier);
+        // Table check: a table noted at an earlier frame that moved far from the last accepted one is memory the game
+        // already reused. Rejected: no build, and the screen pass uses the fitted model this frame.
+        list->SetPipelineState(_inverse_decide);
+        list->Dispatch(1, 1, 1);
+        list->ResourceBarrier(1, &uav_barrier);
+        list->SetPipelineState(_inverse_commit);
+        list->Dispatch(8, 8, 8);
+        list->ResourceBarrier(1, &uav_barrier);
+        // Warm start: each node solved again in last frame's cell. Nodes that lose their exact solution search the
+        // 27 cells around and, failing that, keep a cleared key for the scatter.
+        list->SetPipelineState(_inverse_warm);
+        list->Dispatch(groups, groups, groups);
+        list->ResourceBarrier(1, &uav_barrier);
+    }
+    // Cell scatter (full builds, and the nodes the warm start left): clear the keys, each table cell offers its
+    // solution to the nodes in its output box, each node solves again in the winning cell.
+    list->SetPipelineState(_inverse_clear);
+    list->Dispatch(groups, groups, groups);
+    list->ResourceBarrier(1, &uav_barrier);
+    list->SetPipelineState(_inverse_scatter);
+    list->Dispatch(8, 8, 8); // 31^3 cells
+    list->ResourceBarrier(1, &uav_barrier);
+    list->SetPipelineState(_inverse_resolve);
+    list->Dispatch(groups, groups, groups);
+    const D3D12_RESOURCE_BARRIER barriers[2] = {
+        transition(_inverse, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        uav_barrier,
+    };
+    list->ResourceBarrier(2, barriers);
+    return true;
 }

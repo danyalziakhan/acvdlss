@@ -231,6 +231,9 @@ void tell_driver(int mode)
         snprintf(text, sizeof(text), "Reflex: the driver refused the setting (%d)", status);
     }
     log_text(text);
+    // dxvk-nvapi refuses it when vkd3d-proton has no low latency support.
+    if (status != NVAPI_OK && running_under_wine())
+        log_text("Reflex under Wine needs dxvk-nvapi and a vkd3d-proton with VK_NV_low_latency2");
     g_applied = mode;
 }
 

@@ -32,6 +32,8 @@ std::string thread_stack(unsigned long thread_id);
 void log_exit();
 // Wine or Proton (ntdll exports wine_get_version).
 bool running_under_wine();
+// What DLSS needs under Wine and whether dxvk-nvapi is there. For when DLSS can't start.
+void log_wine_dlss_help();
 
 struct settings
 {
@@ -46,9 +48,10 @@ struct settings
     std::atomic<bool> debug{false};
     // HUD-less image for frame generation tools.
     std::atomic<bool> hudless{true};
-    // The game's vignette with DLSS. 0 the game's own: stays in DLSS's input and may smear. 1 redrawn:
-    // kept out of DLSS's input and drawn after it through the game's measured response. Strength is a
-    // factor on the game's. 0 is none.
+    // The game's vignette with DLSS. 0 Game's own (default): stays in DLSS's input and may smear. 1 Redrawn (fast):
+    // kept out of DLSS's input and drawn after it through the game's measured response. 2 Redrawn (exact): drawn after
+    // it through the game's own grading table. The measured response in HDR, for pixels the table can't invert and in
+    // frames whose table fails the check. Strength is a factor on the game's. 0 is none.
     std::atomic<uint32_t> vignette_mode{0};
     std::atomic<float> vignette_strength{1.0f};
 };

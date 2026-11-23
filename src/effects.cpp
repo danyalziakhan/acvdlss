@@ -35,9 +35,9 @@ std::mutex g_lock;
 effect_runtime *g_runtime = nullptr;
 bound_texture g_motion, g_depth, g_hudless;
 resource g_placeholder = {0};
-// A view of the placeholder, made once. Bound in place of the HUD-less image in frames DLSS skipped, so
-// effects read the current screen instead of an older frame's image. Kept, so no view is made or destroyed
-// per frame when a cutscene skips frames back and forth.
+// A view of the placeholder, made once. It is bound in place of the HUD-less image in frames DLSS skipped.
+// Effects then read the current screen instead of an older frame's image. It is kept so no view is made or
+// destroyed per frame when a cutscene skips frames back and forth.
 resource_view g_stale_view = {0};
 bool g_showing_stale = false;
 // Read by the DLSS pass on another thread.

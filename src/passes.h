@@ -41,6 +41,12 @@ struct screen_fx
     std::optional<radial_constants> radial;
     std::optional<double_image_constants> doubling;
     std::optional<lens_constants> lens;
+    // The exact vignette through the game's grading table.
+    ID3D12Resource *lut = nullptr; // the game's 32^3 table (t4 space 2), null for the fitted model
+    DXGI_FORMAT lut_format = DXGI_FORMAT_UNKNOWN;
+    float lut_on = 0.0f; // 1 when the game's c0.z (an integer flag) is set, 0 for its closed-form curve
+    float split = 0.0f;  // the game's c6.x: the second chain's side, which falls back to the fitted model
+    bool table_this_frame = false; // the table was noted at this frame's tonemapping draw
 
     bool any() const { return vignette > 0.0f || radial || doubling || lens; }
 };
@@ -53,6 +59,9 @@ struct screen_effect_constants
     radial_constants radial;
     lens_constants lens;
     double_image_constants doubling; // amount 0 for off
+    float exact[4]; // x 1 for the exact vignette, y 1 when the game's table is on, z its c6.x, w 1 (filtered residual)
+    float exact_opts[4]; // start (0 interpolated), Newton steps, accepted residual, fallback rule (0 residual)
+    float exact_guard[4]; // largest amplification, state texture bound, reject folds, reject table edges
 };
 static_assert(sizeof(screen_effect_constants) <= sizeof(prepare_constants), "too many root constants");
 
@@ -102,6 +111,7 @@ public:
     // What finish() produced and its state afterward.
     ID3D12Resource *screen_image(float sharpness, const screen_fx &fx, uint32_t &state) const;
     DXGI_FORMAT color_format() const { return _color_format; }
+
     const std::string &error() const { return _error; }
 
 private:
@@ -112,6 +122,7 @@ private:
     D3D12_CPU_DESCRIPTOR_HANDLE offset(D3D12_CPU_DESCRIPTOR_HANDLE base, uint32_t index) const;
     void write_srv(D3D12_CPU_DESCRIPTOR_HANDLE at, ID3D12Resource *resource, DXGI_FORMAT format);
     void write_uav(D3D12_CPU_DESCRIPTOR_HANDLE at, ID3D12Resource *resource, DXGI_FORMAT format);
+    void write_srv3d(D3D12_CPU_DESCRIPTOR_HANDLE at, ID3D12Resource *resource, DXGI_FORMAT format);
     void dispatch(ID3D12GraphicsCommandList *list, ID3D12PipelineState *pipeline, const void *constants,
                   uint32_t constant_count, ID3D12Resource *source, ID3D12Resource *target, DXGI_FORMAT target_format,
                   uint32_t width, uint32_t height);
@@ -122,6 +133,20 @@ private:
     ID3D12PipelineState *_rcas = nullptr;
     ID3D12PipelineState *_downsample = nullptr;
     ID3D12PipelineState *_screen_effects = nullptr;
+    ID3D12PipelineState *_inverse_clear = nullptr;    // exact vignette: cell scatter build (3 passes)
+    ID3D12PipelineState *_inverse_scatter = nullptr;
+    ID3D12PipelineState *_inverse_resolve = nullptr;
+    ID3D12PipelineState *_inverse_begin = nullptr;    // change detector (2 passes)
+    ID3D12PipelineState *_inverse_detect = nullptr;
+    ID3D12PipelineState *_inverse_warm = nullptr;     // warm start
+    ID3D12PipelineState *_inverse_decide = nullptr;   // table check (2 passes)
+    ID3D12PipelineState *_inverse_commit = nullptr;
+    ID3D12Resource *_inverse = nullptr;               // 33^3 RGBA32F, LUT coordinate per graded color
+    ID3D12Resource *_inverse_keys = nullptr;          // 33^3 R32_UINT, the scatter build's winning cell per node
+    ID3D12Resource *_inverse_state = nullptr;         // 32x32x193 R32_UINT: table bits, counters, anchor bits
+    bool _inverse_force = true;                       // the next build is a full one (new textures)
+    bool build_inverse(ID3D12GraphicsCommandList *list, ID3D12Resource *lut, DXGI_FORMAT lut_format,
+                       bool table_this_frame);
     ID3D12DescriptorHeap *_heap = nullptr;
     uint32_t _increment = 0;
     uint32_t _next_slot = 0;

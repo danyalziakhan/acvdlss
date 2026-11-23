@@ -87,12 +87,12 @@ static uint32_t read_preset()
     return 0;
 }
 
-// ReShade's Generic Depth add-on copies the game's depth buffer on ReShade's own command list before effects,
-// every frame, whether or not an effect uses it. During a fast travel or a load the game reuses that memory while
-// the buffer still exists. The copy then faulted the GPU and the game closed, even with no other add-on. With
-// copies before clear operations at full (2), it copies on the game's own command lists instead, while the
-// buffer is valid. It reads the setting when the device is made, after add-ons load. So it is set here when
-// Generic Depth is on. None of our features need it, so turning it off works as well.
+// ReShade's Generic Depth add-on copies the game's depth buffer on ReShade's own command list before effects.
+// It does this every frame, even when no effect uses it. During a fast travel or a load the game reuses that
+// memory while the buffer still exists. The copy then faulted the GPU and the game closed, even with no other
+// add-on. With copies before clear operations at full (2) it copies on the game's own command lists instead,
+// while the buffer is valid. It reads the setting when the device is made, after add-ons load. So it is set here
+// when Generic Depth is on. None of our features need it. Turning it off works as well.
 static void guard_generic_depth()
 {
     char disabled[2048] = {};
@@ -120,6 +120,21 @@ static void guard_generic_depth()
     acv_log(reshade::log::level::warning, text);
 }
 
+// acvdlss.ini keeps the vignette option as a number: 0 Game's own, 1 Redrawn (fast), 2 Redrawn (exact). 0.6.2's 0 and 1
+// mean the same. Anything else resets [Image] to the defaults.
+static const char *const VIGNETTES[] = {"Game's own", "Redrawn (fast)", "Redrawn (exact)"};
+
+static uint32_t read_vignette_method()
+{
+    const int value = config_int("Image", "VignetteMethod", 0);
+    if (value >= 0 && value < int(std::size(VIGNETTES)))
+        return uint32_t(value);
+    config_set("Image", "VignetteMethod", 0);
+    config_set("Image", "VignetteStrength", 100);
+    acv_log(reshade::log::level::info, "acvdlss.ini: VignetteMethod is not 0, 1 or 2. [Image] is back to its defaults");
+    return 0;
+}
+
 static void load_settings()
 {
     config_open();
@@ -131,7 +146,7 @@ static void load_settings()
     g_settings.hudless = config_int("OptiScaler", "HudlessImage", 1) != 0;
     const int positions = config_int("Advanced", "JitterPositions", 0); // Auto reads as 0
     g_settings.jitter_positions = positions == 8 || positions == 16 || positions == 32 ? uint32_t(positions) : 0;
-    g_settings.vignette_mode = uint32_t(std::clamp(config_int("Image", "VignetteMethod", 0), 0, 1));
+    g_settings.vignette_mode = read_vignette_method();
     g_settings.vignette_strength = float(std::clamp(config_int("Image", "VignetteStrength", 100), 0, 200)) / 100.0f;
     g_settings.debug = config_int("Diagnostics", "Debug", 0) != 0;
 
@@ -382,6 +397,8 @@ static void draw_window(effect_runtime *runtime)
     // Fits the longest status line at ReShade's default font size of 13.
     const float scale = ImGui::GetFontSize() / 13.0f;
     ImGui::SetWindowSize(ImVec2(560.0f * scale, 315.0f * scale), ImGuiCond_FirstUseEver);
+    // The height follows the settings, so every one shows without scrolling. ImGui keeps it on the screen.
+    ImGui::SetWindowSize(ImVec2(ImGui::GetWindowWidth(), 0.0f));
 
     const float top = ImGui::GetCursorPosY();
     const taa_status s = taa_get_status();
@@ -438,7 +455,6 @@ static void draw_window(effect_runtime *runtime)
                                       "Boost keeps GPU clocks high when the CPU is the bottleneck. "
                                       "It uses more power.");
 
-    static const char *VIGNETTES[] = {"Game's own", "Redrawn"};
     int vignette = int(g_settings.vignette_mode.load());
     if (ImGui::Combo("Vignette", &vignette, VIGNETTES, int(std::size(VIGNETTES))))
     {
@@ -448,7 +464,10 @@ static void draw_window(effect_runtime *runtime)
     }
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Game's own: the game draws it before DLSS. It can smear at the edges.\n"
-                          "Redrawn: drawn again after DLSS to look like the game's own. It doesn't smear.");
+                          "Redrawn (fast): drawn again after DLSS to look like the game's own. Colors can differ a\n"
+                          "little in some scenes.\n"
+                          "Redrawn (exact): drawn again after DLSS through the game's own color grading. Closest to\n"
+                          "the game's own, costs a little more.");
 
     int strength = int(std::lround(g_settings.vignette_strength.load() * 100.0f));
     if (ImGui::SliderInt("Vignette strength", &strength, 0, 200, "%d%%", ImGuiSliderFlags_AlwaysClamp))

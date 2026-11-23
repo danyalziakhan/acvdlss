@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <cwchar>
 #include <cwctype>
@@ -166,6 +167,85 @@ static std::string game_build()
     return text;
 }
 
+static std::string utf8(const wchar_t *text)
+{
+    const int n = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+    std::string out(size_t(n > 0 ? n - 1 : 0), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text, -1, out.data(), n, nullptr, nullptr);
+    return out;
+}
+
+// First line of a Linux file through Wine's Z: drive, or empty.
+static std::string linux_first_line(const std::wstring &unix_path)
+{
+    std::wstring path = L"Z:" + unix_path;
+    std::replace(path.begin(), path.end(), L'/', L'\\');
+    FILE *file = _wfopen(path.c_str(), L"rb");
+    if (file == nullptr)
+        return {};
+    char text[256] = "";
+    const bool read = fgets(text, int(std::size(text)), file) != nullptr;
+    fclose(file);
+    std::string line = read ? text : "";
+    while (!line.empty() && (line.back() == '\n' || line.back() == '\r' || line.back() == ' '))
+        line.pop_back();
+    return line;
+}
+
+// Under Wine dxvk-nvapi reports a made-up driver (DXVK_NVAPI_DRIVER_VERSION). The kernel module has the real one.
+// Proton's tool folder names its build. vkd3d-proton and dxvk-nvapi carry no version resource.
+static void log_linux_versions()
+{
+    // "NVRM version: NVIDIA UNIX x86_64 Kernel Module  580.95.05  ..." or "... Open Kernel Module for x86_64  ..."
+    const std::string module = linux_first_line(L"/proc/driver/nvidia/version");
+    std::string driver;
+    size_t at = module.find("Module");
+    while (at != std::string::npos)
+    {
+        const size_t start = module.find_first_not_of(' ', at);
+        if (start == std::string::npos)
+            break;
+        at = module.find(' ', start);
+        const std::string word = module.substr(start, at == std::string::npos ? std::string::npos : at - start);
+        if (isdigit(static_cast<unsigned char>(word[0])) && word.find('.') != std::string::npos)
+        {
+            driver = word;
+            break;
+        }
+    }
+    std::string line = "Linux side: NVIDIA driver " + (driver.empty() ? std::string("unknown") : driver);
+    if (module.find("Open Kernel Module") != std::string::npos)
+        line += " (open kernel module)";
+
+    // Steam lists the Proton folder first. Launchers that use umu set PROTONPATH.
+    std::wstring tool;
+    for (const wchar_t *name : {L"STEAM_COMPAT_TOOL_PATHS", L"PROTONPATH"})
+    {
+        wchar_t value[1024] = L"";
+        const DWORD n = GetEnvironmentVariableW(name, value, DWORD(std::size(value)));
+        if (n == 0 || n >= std::size(value))
+            continue;
+        tool = value;
+        tool = tool.substr(0, tool.find(L':'));
+        while (!tool.empty() && tool.back() == L'/')
+            tool.pop_back();
+        if (!tool.empty())
+            break;
+    }
+    if (!tool.empty())
+    {
+        // "1712345678 proton-9.0-4". The number is a build time.
+        std::string version = linux_first_line(tool + L"/version");
+        const size_t space = version.find(' ');
+        if (space != std::string::npos && version.find_first_not_of("0123456789") == space)
+            version = version.substr(space + 1);
+        if (version.empty())
+            version = utf8(tool.substr(tool.find_last_of(L'/') + 1).c_str());
+        line += ", Proton " + version;
+    }
+    acv_log(reshade::log::level::info, line.c_str());
+}
+
 // The Windows version. Under Wine or Proton also the Wine version, the host and the settings that decide DLSS.
 static void log_system()
 {
@@ -196,17 +276,31 @@ static void log_system()
     if (wine == nullptr)
         return;
 
+    // All of Proton's, dxvk-nvapi's and vkd3d-proton's switches. dxvk-nvapi's DRS ones can override the preset.
+    // Values with a path are left out. They can hold a user name.
     line = "Wine settings:";
-    for (const char *name : {"PROTON_ENABLE_NVAPI", "DXVK_ENABLE_NVAPI", "PROTON_HIDE_NVIDIA_GPU",
-                             "PROTON_ENABLE_NGX_UPDATER", "DXVK_NVAPI_DRIVER_VERSION", "DXVK_NVAPI_ALLOW_OTHER_DRIVERS",
-                             "VKD3D_CONFIG", "VKD3D_FEATURE_LEVEL", "WINEDLLOVERRIDES", "SteamDeck"})
+    if (wchar_t *block = GetEnvironmentStringsW())
     {
-        char value[256] = "";
-        if (GetEnvironmentVariableA(name, value, DWORD(std::size(value))) > 0)
-            line += std::string(" ") + name + "=" + value;
+        for (const wchar_t *entry = block; *entry != L'\0'; entry += wcslen(entry) + 1)
+        {
+            bool wanted = false;
+            for (const wchar_t *prefix : {L"PROTON_", L"DXVK_NVAPI", L"DXVK_ENABLE_NVAPI", L"VKD3D_",
+                                          L"WINEDLLOVERRIDES=", L"WINEFSYNC=", L"WINEESYNC=", L"SteamDeck="})
+                wanted |= wcsncmp(entry, prefix, wcslen(prefix)) == 0;
+            if (!wanted)
+                continue;
+            const std::string text = utf8(entry);
+            const size_t equals = text.find('=');
+            if (equals != std::string::npos && text.find_first_of("/\\", equals) != std::string::npos)
+                line += " " + text.substr(0, equals) + "=(a path)";
+            else
+                line += " " + text;
+        }
+        FreeEnvironmentStringsW(block);
     }
     acv_log(reshade::log::level::info,
             line == "Wine settings:" ? "Wine settings: none of the known ones set" : line.c_str());
+    log_linux_versions();
 }
 
 void log_start()
@@ -345,6 +439,19 @@ static const char *fatal_name(DWORD code)
     }
 }
 
+// Wine writes this into the DOS stub of its own PE DLLs.
+static bool wine_builtin(const std::wstring &path)
+{
+    FILE *file = _wfopen(path.c_str(), L"rb");
+    if (file == nullptr)
+        return false;
+    char head[0x60] = {};
+    const size_t n = fread(head, 1, sizeof(head), file);
+    fclose(file);
+    static const char MARK[] = "Wine builtin DLL";
+    return n >= 0x40 + sizeof(MARK) - 1 && memcmp(head + 0x40, MARK, sizeof(MARK) - 1) == 0;
+}
+
 // The game's crash handler kills the process before anything reaches our log. Games also raise and handle
 // these on purpose. Hence the cap and the wording.
 static LONG CALLBACK on_exception(EXCEPTION_POINTERS *info)
@@ -414,6 +521,8 @@ void log_adapter(ID3D12Device *device)
     // d3d12.dll and dxgi.dll by name would be ReShade's. Those come from the system folder.
     wchar_t system[MAX_PATH] = L"";
     GetSystemDirectoryW(system, MAX_PATH);
+    // Wine's own d3d12 has no DLSS support. DLSS needs vkd3d-proton and dxvk-nvapi there.
+    const bool wine = running_under_wine();
     line = "runtime:";
     for (const wchar_t *name : {L"d3d12.dll", L"d3d12core.dll", L"dxgi.dll", L"nvapi64.dll"})
     {
@@ -428,8 +537,9 @@ void log_adapter(ID3D12Device *device)
         if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES)
             continue;
         const std::string version = file_version(path), description = file_description(path);
-        snprintf(text, sizeof(text), " %ls %s%s%s%s;", path.c_str(), version.empty() ? "no version" : version.c_str(),
-                 description.empty() ? "" : " (", description.c_str(), description.empty() ? "" : ")");
+        snprintf(text, sizeof(text), " %ls %s%s%s%s%s;", path.c_str(), version.empty() ? "no version" : version.c_str(),
+                 description.empty() ? "" : " (", description.c_str(), description.empty() ? "" : ")",
+                 wine && wine_builtin(path) ? " Wine builtin" : "");
         line += text;
     }
     if (line.back() == ';')
@@ -437,7 +547,7 @@ void log_adapter(ID3D12Device *device)
     acv_log(reshade::log::level::info, line.c_str());
 }
 
-// Most bug reports come down to another upscaler, an old nvngx_dlss.dll or a second DLSS-NR.
+// Bug reports often come down to another upscaler, an old nvngx_dlss.dll or a second DLSS-NR.
 void log_modules()
 {
     const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
@@ -490,6 +600,20 @@ void log_modules()
 bool running_under_wine()
 {
     return GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
+}
+
+void log_wine_dlss_help()
+{
+    wchar_t system[MAX_PATH] = L"";
+    GetSystemDirectoryW(system, MAX_PATH);
+    const std::wstring nvapi = std::wstring(system) + L"\\nvapi64.dll";
+    const char *state = GetModuleHandleW(L"nvapi64.dll") != nullptr                       ? "loaded"
+                        : GetFileAttributesW(nvapi.c_str()) != INVALID_FILE_ATTRIBUTES ? "in the system folder"
+                                                                                         : "missing";
+    const std::string text = std::string("under Wine DLSS needs vkd3d-proton and dxvk-nvapi. nvapi64.dll is ") +
+                             state + ". Proton turns dxvk-nvapi on with PROTON_ENABLE_NVAPI=1. Plain Wine uses "
+                                     "DXVK_ENABLE_NVAPI=1";
+    acv_log(reshade::log::level::info, text.c_str());
 }
 
 void log_exit()

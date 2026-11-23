@@ -15,6 +15,7 @@
 #include <softpub.h>
 #include <wintrust.h>
 
+#include <atomic>
 #include <cfloat>
 #include <cstring>
 #include <cstdio>
@@ -27,8 +28,8 @@ namespace
 // Under Wine, DLSS reaches vkd3d-proton's CUDA interop (ID3D12DeviceExt GetCudaTextureObject and
 // GetCudaSurfaceObject). ReShade hooks those and decodes every CPU descriptor handle as one from its own wrapped
 // descriptor heaps. It finds its wrapper through this private-data tag on the device. NGX gets the real device,
-// so its heaps are not wrapped, and the decoded handle pointed nowhere: vkd3d-proton crashed reading it while
-// the DLSS feature was made. Without the tag the hook passes the handles on unchanged. So under Wine the tag is
+// so its heaps are not wrapped. The decoded handle pointed nowhere and vkd3d-proton crashed reading it while the
+// DLSS feature was made. Without the tag the hook passes the handles on unchanged. So under Wine the tag is
 // taken off for the length of each DLSS call and put back after. Windows has no such calls and is not touched.
 const GUID RESHADE_DEVICE_TAG = {0x2523AFF4, 0x978B, 0x4939, {0xBA, 0x16, 0x8E, 0xE8, 0x76, 0xA4, 0xCB, 0x2A}};
 
@@ -41,8 +42,22 @@ class reshade_tag_off
         if (!wine || device == nullptr)
             return;
         UINT size = sizeof(_proxy);
-        if (FAILED(device->GetPrivateData(RESHADE_DEVICE_TAG, &size, &_proxy)) || size != sizeof(_proxy) ||
-            _proxy == nullptr || FAILED(device->SetPrivateData(RESHADE_DEVICE_TAG, 0, nullptr)))
+        const HRESULT found = device->GetPrivateData(RESHADE_DEVICE_TAG, &size, &_proxy);
+        if (FAILED(found) || size != sizeof(_proxy) || _proxy == nullptr)
+        {
+            // A ReShade that stores its wrapper another way would decode NGX's handles again.
+            static std::atomic<bool> noted{false};
+            if (!noted.exchange(true))
+            {
+                char text[160];
+                snprintf(text, sizeof(text), "running under Wine: ReShade's device tag was not found (0x%08lX, "
+                         "%u bytes). DLSS calls go to vkd3d-proton as they are", static_cast<unsigned long>(found),
+                         size);
+                acv_log(reshade::log::level::warning, text);
+            }
+            return;
+        }
+        if (FAILED(device->SetPrivateData(RESHADE_DEVICE_TAG, 0, nullptr)))
             return;
         _device = device;
         static bool logged = false;
@@ -55,8 +70,18 @@ class reshade_tag_off
     }
     ~reshade_tag_off()
     {
-        if (_device != nullptr)
-            _device->SetPrivateData(RESHADE_DEVICE_TAG, sizeof(_proxy), &_proxy);
+        if (_device == nullptr)
+            return;
+        const HRESULT restored = _device->SetPrivateData(RESHADE_DEVICE_TAG, sizeof(_proxy), &_proxy);
+        // Without the tag ReShade can't find its wrapper for this device.
+        static std::atomic<bool> noted{false};
+        if (FAILED(restored) && !noted.exchange(true))
+        {
+            char text[128];
+            snprintf(text, sizeof(text), "running under Wine: ReShade's device tag could not be put back (0x%08lX)",
+                     static_cast<unsigned long>(restored));
+            acv_log(reshade::log::level::error, text);
+        }
     }
     reshade_tag_off(const reshade_tag_off &) = delete;
     reshade_tag_off &operator=(const reshade_tag_off &) = delete;
@@ -114,8 +139,9 @@ static void log_versions(const std::wstring &folder)
 
 static std::string describe(const char *what, NVSDK_NGX_Result result)
 {
-    char text[160];
-    snprintf(text, sizeof(text), "%s failed (0x%08X)", what, unsigned(result));
+    const wchar_t *name = GetNGXResultAsString(result);
+    char text[192];
+    snprintf(text, sizeof(text), "%s failed (0x%08X, %ls)", what, unsigned(result), name != nullptr ? name : L"?");
     return text;
 }
 
@@ -125,6 +151,14 @@ static void NVSDK_CONV log_ngx(const char *message, NVSDK_NGX_Logging_Level, NVS
     while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
         line.pop_back();
     acv_log(reshade::log::level::info, line.c_str());
+    // Linux test 2026-11-19 (Proton, RTX 4080 SUPER): presets L and M logged this 5 times at their first frame.
+    // vkd3d-proton turns down a descriptor it can't map for CUDA (E_INVALIDARG). Preset K had no such error.
+    static std::atomic<bool> noted{false};
+    if (strstr(message, "GetCudaIndependentDescriptorObject failed") != nullptr && running_under_wine() &&
+        !noted.exchange(true))
+        acv_log(reshade::log::level::warning, "running under Wine: vkd3d-proton turned down a CUDA descriptor "
+                                              "that DLSS asked for. If the image looks wrong with this preset, "
+                                              "try preset K");
 }
 
 // 0 lets DLSS choose, 1 to 13 are A to M.
