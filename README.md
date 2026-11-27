@@ -1,6 +1,12 @@
-# ACV DLSS + Camera Motion Blur
+# Assassin's Creed Valhalla — DLSS & Camera Motion Blur
 
 > **Status: Stable — tested in-game by the maintainer.** Use the tested build; development snapshots and experimental revisions may require separate validation.
+
+## Downloads
+
+- [Releases](https://github.com/takagiginjo/acvdlss-camera-mb/releases) — published packages, when available.
+- [Successful GitHub Actions build](https://github.com/takagiginjo/acvdlss-camera-mb/actions/runs/46009038642) — artifact `acvdlss`. Sign in to GitHub to download the ZIP, then extract it before installation. Workflow success confirms compilation, not independent gameplay validation of that exact binary.
+- [ReShade 6.8.0](https://github.com/crosire/reshade/releases/tag/v6.8.0) — use the installer with full add-on support.
 
 
 ReShade add-on that replaces Assassin's Creed Valhalla's own anti-aliasing (TAA)
@@ -202,3 +208,7 @@ and tested before being included.
 ## License
 
 MIT
+
+## Troubleshooting
+
+Install only one version of this add-on at a time. If the effect does not appear, confirm ReShade was installed with full add-on support and check `ReShade.log`. Include the game version, GPU, add-on build and relevant logs when reporting issues.
